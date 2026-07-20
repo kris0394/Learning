@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1">
+<title>Learn Anything</title>
+<style>
+  :root {
+    --ink: #1f2420;
+    --paper: #f6f4ee;
+    --moss: #3f5d47;
+    --moss-dark: #2c4232;
+    --clay: #a9603f;
+    --line: #d9d3c4;
+    --card: #ffffff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: 'Iowan Old Style', 'Palatino Linotype', Georgia, serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .app { max-width: 820px; margin: 0 auto; padding: 28px 20px 80px; }
+  header.top {
+    display: flex; align-items: baseline; justify-content: space-between;
+    border-bottom: 2px solid var(--ink); padding-bottom: 14px; margin-bottom: 28px;
+  }
+  header.top h1 {
+    font-size: 26px; margin: 0; letter-spacing: 0.5px; font-weight: 700;
+  }
+  header.top .tag {
+    font-family: -apple-system, sans-serif; font-size: 11px; text-transform: uppercase;
+    letter-spacing: 1.5px; color: var(--moss); border: 1px solid var(--moss);
+    padding: 4px 8px; border-radius: 2px;
+  }
+  .budget {
+    font-family: -apple-system, sans-serif; font-size: 12px; color: #7a7568;
+    margin-bottom: 24px; display: flex; gap: 6px; align-items: center;
+  }
+  .budget .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--moss); }
+  .budget.warn .dot { background: var(--clay); }
+
+  button {
+    font-family: -apple-system, sans-serif; cursor: pointer; border: none;
+    border-radius: 3px; font-size: 14px; padding: 10px 16px; font-weight: 600;
+  }
+  .btn-primary { background: var(--moss); color: white; }
+  .btn-primary:hover { background: var(--moss-dark); }
+  .btn-primary:disabled { background: #b9c2ba; cursor: default; }
+  .btn-ghost { background: transparent; color: var(--moss); border: 1px solid var(--moss); }
+  .btn-ghost:hover { background: #eef2ee; }
+  input[type=text] {
+    font-family: 'Iowan Old Style', Georgia, serif; font-size: 17px; padding: 12px 14px;
+    border: 1px solid var(--line); border-radius: 3px; width: 100%; background: white;
+  }
+  input[type=text]:focus { outline: 2px solid var(--moss); outline-offset: 1px; }
+
+  /* HOME */
+  .home-grid { display: grid; gap: 14px; margin-bottom: 34px; }
+  .topic-card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 6px;
+    padding: 16px 18px; display: flex; justify-content: space-between; align-items: center;
+    cursor: pointer; transition: border-color .15s;
+  }
+  .topic-card:hover { border-color: var(--moss); }
+  .topic-card h3 { margin: 0 0 4px; font-size: 18px; }
+  .topic-card .meta { font-family: -apple-system, sans-serif; font-size: 12px; color: #8a8578; }
+  .progress-ring { display: flex; align-items: center; gap: 10px; }
+  .bar-track { width: 90px; height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
+  .bar-fill { height: 100%; background: var(--moss); }
+  .pct { font-family: -apple-system, sans-serif; font-size: 13px; color: var(--moss); font-weight: 700; }
+
+  .new-topic-box {
+    background: var(--card); border: 1px dashed var(--line); border-radius: 6px; padding: 22px;
+  }
+  .new-topic-box h2 { margin-top: 0; font-size: 19px; }
+  .row { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+  .chip-group { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+  .chip {
+    font-family: -apple-system, sans-serif; font-size: 13px; padding: 7px 13px;
+    border: 1px solid var(--line); border-radius: 20px; cursor: pointer; background: white;
+  }
+  .chip.selected { background: var(--moss); color: white; border-color: var(--moss); }
+  label.field-label {
+    font-family: -apple-system, sans-serif; font-size: 12px; text-transform: uppercase;
+    letter-spacing: 1px; color: #8a8578; display: block; margin: 16px 0 4px;
+  }
+
+  /* CURRICULUM / LESSON view */
+  .backlink {
+    font-family: -apple-system, sans-serif; font-size: 13px; color: var(--moss);
+    cursor: pointer; margin-bottom: 16px; display: inline-block;
+  }
+  .curric-title { font-size: 24px; margin: 0 0 4px; }
+  .lesson-list { display: grid; gap: 8px; margin-top: 18px; }
+  .lesson-row {
+    display: flex; align-items: center; gap: 12px; padding: 12px 14px;
+    border: 1px solid var(--line); border-radius: 5px; background: var(--card); cursor: pointer;
+  }
+  .lesson-row.locked { opacity: 0.5; cursor: default; }
+  .lesson-row.done { border-color: var(--moss); }
+  .lesson-num {
+    font-family: -apple-system, sans-serif; font-size: 12px; width: 22px; height: 22px;
+    border-radius: 50%; border: 1px solid var(--moss); color: var(--moss);
+    display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+  }
+  .lesson-row.done .lesson-num { background: var(--moss); color: white; }
+
+  .lesson-view h2 { font-size: 24px; margin-bottom: 4px; }
+  .lesson-body { line-height: 1.65; font-size: 16.5px; }
+  .lesson-body h3 { font-size: 15px; text-transform: uppercase; letter-spacing: 1px; color: var(--moss); font-family: -apple-system, sans-serif; margin: 22px 0 6px; }
+  .lesson-body p { margin: 0 0 12px; }
+  .lesson-body ul, .lesson-body ol { margin: 0 0 12px 20px; }
+
+  .chat-panel { margin-top: 26px; border-top: 1px solid var(--line); padding-top: 18px; }
+  .chat-log { display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px; }
+  .msg { padding: 10px 14px; border-radius: 6px; font-size: 15px; line-height: 1.5; max-width: 90%; }
+  .msg.user { background: #eef2ee; align-self: flex-end; }
+  .msg.ai { background: var(--card); border: 1px solid var(--line); align-self: flex-start; }
+  .quick-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+
+  .loading { font-family: -apple-system, sans-serif; color: #8a8578; font-size: 14px; padding: 20px 0; }
+  .error-box {
+    background: #fbeee8; border: 1px solid var(--clay); color: #7a3a20; padding: 12px 14px;
+    border-radius: 5px; font-family: -apple-system, sans-serif; font-size: 13.5px; margin: 14px 0;
+  }
+  .lesson-img {
+    width: 100%; max-height: 260px; object-fit: cover; border-radius: 6px; margin-bottom: 16px;
+    border: 1px solid var(--line);
+  }
+  img, svg { max-width: 100%; }
+
+  @media (max-width: 600px) {
+    .app { padding: 16px 14px 60px; }
+    header.top { flex-direction: column; align-items: flex-start; gap: 8px; }
+    header.top h1 { font-size: 21px; }
+    .topic-card { flex-direction: column; align-items: flex-start; gap: 10px; }
+    .progress-ring { width: 100%; }
+    .bar-track { flex: 1; }
+    .row { flex-direction: column; }
+    .row button, .row input { width: 100%; }
+    .chip { font-size: 12.5px; padding: 6px 11px; }
+    .lesson-body { font-size: 16px; }
+    .msg { max-width: 100%; }
+    .quick-actions button { flex: 1 1 45%; font-size: 12.5px; padding: 8px 10px; }
+  }
+</style>
+</head>
+<body>
+<div id="root" class="app"></div>
+
+<script>
+window.addEventListener("error", (e) => {
+  const root = document.getElementById("root");
+  if (root && !root.hasChildNodes()) {
+    root.innerHTML = '<div style="font-family:-apple-system,sans-serif;padding:20px;color:#7a3a20;">' +
+      '<h2 style="margin-top:0;">Something failed to load</h2>' +
+      '<p style="font-size:14px;">' + (e.message || "Unknown error") + '</p>' +
+      '<p style="font-size:13px;color:#8a8578;">Try opening this directly in the Claude app/chat rather than as a downloaded file — some mobile browsers block local scripts.</p>' +
+      '</div>';
+  }
+});
+
+// 👇 Paste your Cloudflare Worker URL here after you set it up (see cloudflare-worker.js instructions)
+const WORKER_URL = "https://learn-anything-proxy.sadagopankrishnan.workers.dev/";
+const API_URL = WORKER_URL;
+// Primary: OpenRouter's own auto-router, always resolves to a currently-live free model.
+// Fallbacks used only if the primary call errors out.
+const MODEL_CANDIDATES = [
+  "openrouter/free",
+  "meta-llama/llama-3.3-70b-instruct:free",
+  "deepseek/deepseek-chat-v3.1:free",
+  "qwen/qwen3-235b-a22b:free"
+];
+
+
+// Free tier is roughly 15-40 messages per rolling 5-hour window (OpenRouter's own
+// free-model limits are separate: ~50/day, 20/min). We show an estimate, not a guarantee.
+const ASSUMED_BUDGET = 40;
+
+const DAILY_FREE_LIMIT = 50; // OpenRouter's published free-tier daily cap (approximate, may vary)
+const COUNTRIES = ["Global / none", "United States", "United Kingdom", "India", "Nigeria", "Philippines", "Canada", "Australia", "South Africa", "Kenya", "Pakistan", "Brazil", "Mexico", "Germany", "France", "Indonesia", "Other"];
+
+let state = {
+  view: "home",       // home | new | curriculum | lesson
+  topics: {},          // id -> {id,title,level,style,country,lessons:[{title,content,quiz,done,imageUrl}], activeIndex, createdAt}
+  activeTopicId: null,
+  activeLessonIndex: null,
+  newTopicDraft: { title: "", level: "Beginner", style: "examples", country: "Global / none" },
+  chatByLesson: {},    // "topicId:lessonIdx" -> [{role,text}]
+  loading: false,
+  loadingMsg: "",
+  error: null,
+  msgCount: 0,
+  quotaUsedToday: 0,
+  quotaDate: null
+};
+
+function render() { App(); }
+
+async function loadTopics() {
+  try {
+    const res = await window.storage.get("topics", false);
+    if (res && res.value) state.topics = JSON.parse(res.value);
+  } catch (e) { /* no data yet */ }
+  render();
+}
+
+async function saveTopics() {
+  try {
+    await window.storage.set("topics", JSON.stringify(state.topics), false);
+  } catch (e) { console.error("save failed", e); }
+}
+
+function bumpMsgCount() { state.msgCount++; }
+
+function cleanText(s) {
+  if (!s) return s;
+  return s
+    .replace(/\*\*(.*?)\*\*/g, "$1")   // **bold**
+    .replace(/\*(.*?)\*/g, "$1")       // *italic*
+    .replace(/^\*+|\*+$/g, "")         // stray leading/trailing asterisks
+    .trim();
+}
+
+async function callAI(messages, { json = false } = {}) {
+  bumpMsgCount();
+  let lastErr = null;
+  for (const model of MODEL_CANDIDATES) {
+    try {
+      const res = await fetch(API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model, messages, temperature: 0.7 })
+      });
+      if (!res.ok) {
+        const t = await res.text().catch(()=> "");
+        throw new Error("API error " + res.status + ": " + t.slice(0,200));
+      }
+      const data = await res.json();
+      const content = data?.choices?.[0]?.message?.content;
+      if (!content) throw new Error("Empty response from model");
+      if (json) {
+        let cleaned = content.trim().replace(/^```json/i, "").replace(/^```/, "").replace(/```$/, "").trim();
+        return JSON.parse(cleaned);
+      }
+      return content;
+    } catch (e) {
+      lastErr = e;
+      // try next candidate model
+    }
+  }
+  throw lastErr || new Error("All model candidates failed");
+}
+
+// ---------- Actions ----------
+
+async function generateCurriculum() {
+  const draft = state.newTopicDraft;
+  if (!draft.title.trim()) return;
+  state.loading = true;
+  state.loadingMsg = "Building your curriculum...";
+  state.error = null;
+  render();
+
+  const sys = `You are a curriculum designer. Given a topic, learner level, and learning style, output ONLY valid JSON (no markdown fences, no commentary) with this exact shape:
+{"lessons": [{"title": "string"}]}
+Produce 6 to 9 lessons that form a logical learning sequence from foundational to more advanced, appropriate for the stated level. Keep titles short and concrete.`;
+  const countryLine = draft.country ? `\nLearner's country: ${draft.country} (prefer this context where relevant for later lesson examples, not necessarily in titles)` : "";
+  const user = `Topic: ${draft.title}\nLearner level: ${draft.level}\nPreferred learning style: ${draft.style}${countryLine}`;
+
+  try {
+    const result = await callAI([
+      { role: "system", content: sys },
+      { role: "user", content: user }
+    ], { json: true });
+
+    const id = "t_" + Date.now();
+    state.topics[id] = {
+      id,
+      title: draft.title.trim(),
+      level: draft.level,
+      style: draft.style,
+      country: draft.country || "",
+      createdAt: Date.now(),
+      lessons: result.lessons.map(l => ({ title: l.title, content: null, done: false }))
+    };
+    await saveTopics();
+    state.activeTopicId = id;
+    state.view = "curriculum";
+    state.newTopicDraft = { title: "", level: "Beginner", style: "examples", country: draft.country };
+  } catch (e) {
+    state.error = friendlyError(e);
+  }
+  state.loading = false;
+  render();
+}
+
+async function openLesson(topicId, idx) {
+  state.activeTopicId = topicId;
+  state.activeLessonIndex = idx;
+  state.view = "lesson";
+  state.error = null;
+  render();
+
+  const topic = state.topics[topicId];
+  const lesson = topic.lessons[idx];
+  if (lesson.content) return; // cached, no API call
+
+  state.loading = true;
+  state.loadingMsg = "Writing this lesson...";
+  render();
+
+  const priorTitles = topic.lessons.slice(0, idx).map(l => l.title).join(", ") || "none";
+  const countryLine = topic.country ? ` Use examples, references, units, currency, and illustrations relevant to ${topic.country} wherever it naturally fits the topic.` : "";
+  const sys = `You are a patient, engaging tutor writing a single self-contained lesson. Output ONLY valid JSON (no markdown fences) with this shape:
+{"content_html": "string of simple HTML using <p>,<h3>,<ul>,<li>,<strong>,<em> only", "quiz": [{"question":"string","options":["a","b","c","d"],"correctIndex":0,"explanation":"string"}]}
+The content_html should include sections (use <h3> headers): Introduction, an Example, an Analogy, then a short Practice/Summary. Write for a "${topic.level}" learner who prefers a "${topic.style}" style.${countryLine} Include 2-3 quiz questions at the end (in the quiz array, not in content_html). Keep it focused and not too long. Do not use markdown asterisks for bold/italic — use the actual HTML tags instead.`;
+  const user = `Topic: ${topic.title}\nLesson: "${lesson.title}"\nLessons already covered: ${priorTitles}`;
+
+  try {
+    const result = await callAI([
+      { role: "system", content: sys },
+      { role: "user", content: user }
+    ], { json: true });
+    lesson.content = result.content_html;
+    lesson.quiz = (result.quiz || []).map(q => ({
+      ...q,
+      question: cleanText(q.question),
+      options: q.options.map(cleanText),
+      explanation: cleanText(q.explanation)
+    }));
+    // Free, keyless image lookup (Wikipedia) — does not count toward AI exchanges
+    lesson.imageUrl = await fetchLessonImage(topic.title + " " + lesson.title);
+    await saveTopics();
+  } catch (e) {
+    state.error = friendlyError(e);
+  }
+  state.loading = false;
+  render();
+}
+
+function markLessonDone(topicId, idx) {
+  state.topics[topicId].lessons[idx].done = true;
+  saveTopics();
+  render();
+}
+
+async function sendChat(topicId, idx, text, quickAction) {
+  const key = topicId + ":" + idx;
+  if (!state.chatByLesson[key]) state.chatByLesson[key] = [];
+  const log = state.chatByLesson[key];
+  const userText = quickAction || text;
+  if (!userText.trim()) return;
+  log.push({ role: "user", text: userText });
+  state.loading = true;
+  state.loadingMsg = "Thinking...";
+  state.error = null;
+  render();
+
+  const topic = state.topics[topicId];
+  const lesson = topic.lessons[idx];
+  const countryLine = topic.country ? ` Where helpful, use examples relevant to ${topic.country}.` : "";
+  const sys = `You are a friendly tutor helping a learner with the lesson "${lesson.title}" (topic: ${topic.title}, level: ${topic.level}). The lesson content was:\n${stripHtml(lesson.content).slice(0,1500)}\nAnswer the learner's question or request concisely and clearly, matching their level.${countryLine} Write in short paragraphs (2-4 sentences each), separated by a blank line, so it's easy to read on a phone. Plain text only, no markdown asterisks, no bullet symbols, no fences.`;
+
+  const history = log.slice(-6).map(m => ({ role: m.role === "user" ? "user" : "assistant", content: m.text }));
+
+  try {
+    const reply = await callAI([
+      { role: "system", content: sys },
+      ...history
+    ]);
+    log.push({ role: "ai", text: cleanText(reply) });
+  } catch (e) {
+    state.error = friendlyError(e);
+    log.pop(); // remove the unanswered user message from view? keep it but show error
+    log.push({ role: "user", text: userText, failed: true });
+  }
+  state.loading = false;
+  render();
+}
+
+async function fetchLessonImage(query) {
+  try {
+    const url = "https://en.wikipedia.org/w/api.php?action=query&format=json&generator=search&gsrsearch=" +
+      encodeURIComponent(query) + "&gsrlimit=1&prop=pageimages&piprop=thumbnail&pithumbsize=600&origin=*";
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const pages = data?.query?.pages;
+    if (!pages) return null;
+    const first = Object.values(pages)[0];
+    return first?.thumbnail?.source || null;
+  } catch (e) {
+    return null; // images are a nice-to-have, never block the lesson on this
+  }
+}
+
+function stripHtml(html) {
+  const d = document.createElement("div");
+  d.innerHTML = html || "";
+  return d.textContent || "";
+}
+
+function friendlyError(e) {
+  const msg = (e && e.message) || "";
+  if (msg.includes("429") || msg.toLowerCase().includes("rate")) {
+    return "Hit the free-tier rate limit on OpenRouter. Wait a bit and try again — nothing was lost, your progress is saved.";
+  }
+  return "Something went wrong reaching the AI (" + msg.slice(0,120) + "). Your progress is saved — try again in a moment.";
+}
+
+function topicProgress(topic) {
+  const total = topic.lessons.length;
+  const done = topic.lessons.filter(l => l.done).length;
+  return Math.round((done / total) * 100);
+}
+
+// ---------- Render ----------
+
+function App() {
+  const root = document.getElementById("root");
+  root.innerHTML = "";
+
+  const header = el("header", { class: "top" }, [
+    el("h1", {}, "Learn Anything"),
+    el("span", { class: "tag" }, "personal edition")
+  ]);
+  root.appendChild(header);
+
+  const used = state.msgCount;
+  const remaining = Math.max(ASSUMED_BUDGET - used, 0);
+  const budgetWarn = remaining <= 8;
+  root.appendChild(el("div", { class: "budget" + (budgetWarn ? " warn" : "") }, [
+    el("span", { class: "dot" }),
+    el("span", {}, `~${remaining} of ~${ASSUMED_BUDGET} AI exchanges left this window (estimate, free tier varies) · lessons are cached once generated, so revisiting them is free`)
+  ]));
+
+  if (state.error) {
+    root.appendChild(el("div", { class: "error-box" }, state.error));
+  }
+
+  if (state.loading) {
+    root.appendChild(el("div", { class: "loading" }, "⏳ " + state.loadingMsg));
+  }
+
+  if (state.view === "home") root.appendChild(HomeView());
+  if (state.view === "new") root.appendChild(NewTopicView());
+  if (state.view === "curriculum") root.appendChild(CurriculumView());
+  if (state.view === "lesson") root.appendChild(LessonView());
+}
+
+function el(tag, attrs, children) {
+  const e = document.createElement(tag);
+  for (const k in attrs || {}) {
+    if (k === "class") e.className = attrs[k];
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2).toLowerCase(), attrs[k]);
+    else e.setAttribute(k, attrs[k]);
+  }
+  if (typeof children === "string") e.textContent = children;
+  else if (Array.isArray(children)) children.forEach(c => c && e.appendChild(typeof c === "string" ? document.createTextNode(c) : c));
+  else if (children instanceof Node) e.appendChild(children);
+  return e;
+}
+
+function HomeView() {
+  const wrap = document.createDocumentFragment();
+  const grid = el("div", { class: "home-grid" });
+  const topics = Object.values(state.topics).sort((a,b) => b.createdAt - a.createdAt);
+
+  if (topics.length === 0) {
+    grid.appendChild(el("div", { class: "loading" }, "No topics yet — start one below."));
+  }
+  topics.forEach(t => {
+    const pct = topicProgress(t);
+    const card = el("div", { class: "topic-card", onclick: () => { state.activeTopicId = t.id; state.view = "curriculum"; render(); } }, [
+      el("div", {}, [
+        el("h3", {}, t.title),
+        el("div", { class: "meta" }, `${t.level} · ${t.lessons.length} lessons`)
+      ]),
+      el("div", { class: "progress-ring" }, [
+        el("div", { class: "bar-track" }, el("div", { class: "bar-fill", style: `width:${pct}%` })),
+        el("span", { class: "pct" }, pct + "%")
+      ])
+    ]);
+    grid.appendChild(card);
+  });
+  wrap.appendChild(grid);
+
+  const startBtn = el("button", { class: "btn-primary", onclick: () => { state.view = "new"; render(); } }, "+ Start a new topic");
+  wrap.appendChild(startBtn);
+  return wrap;
+}
+
+function NewTopicView() {
+  const wrap = document.createDocumentFragment();
+  wrap.appendChild(el("span", { class: "backlink", onclick: () => { state.view = "home"; render(); } }, "← Back"));
+
+  const box = el("div", { class: "new-topic-box" });
+  box.appendChild(el("h2", {}, "What do you want to learn?"));
+
+  const input = el("input", { type: "text", value: state.newTopicDraft.title, placeholder: "e.g. Comparative religion, Roman history, guitar..." });
+  input.value = state.newTopicDraft.title;
+  input.addEventListener("input", e => { state.newTopicDraft.title = e.target.value; });
+  box.appendChild(input);
+
+  box.appendChild(el("label", { class: "field-label" }, "Your level"));
+  const levels = ["Never heard of it", "Beginner", "Intermediate", "Advanced", "Expert"];
+  const levelGroup = el("div", { class: "chip-group" });
+  levels.forEach(lv => {
+    const chip = el("div", { class: "chip" + (state.newTopicDraft.level === lv ? " selected" : ""), onclick: () => { state.newTopicDraft.level = lv; render(); } }, lv);
+    levelGroup.appendChild(chip);
+  });
+  box.appendChild(levelGroup);
+
+  box.appendChild(el("label", { class: "field-label" }, "Learning style"));
+  const styles = ["stories", "examples", "analogies", "practical", "project-based", "visuals"];
+  const styleGroup = el("div", { class: "chip-group" });
+  styles.forEach(s => {
+    const chip = el("div", { class: "chip" + (state.newTopicDraft.style === s ? " selected" : ""), onclick: () => { state.newTopicDraft.style = s; render(); } }, s);
+    styleGroup.appendChild(chip);
+  });
+  box.appendChild(styleGroup);
+
+  box.appendChild(el("label", { class: "field-label" }, "Your country (optional — tailors examples & illustrations)"));
+  const countryInput = el("input", { type: "text", placeholder: "e.g. India, Nigeria, Brazil..." });
+  countryInput.value = state.newTopicDraft.country;
+  countryInput.addEventListener("input", e => { state.newTopicDraft.country = e.target.value; });
+  box.appendChild(countryInput);
+
+  const row = el("div", { class: "row" });
+  const genBtn = el("button", { class: "btn-primary" }, "Generate curriculum");
+  genBtn.disabled = state.loading;
+  genBtn.addEventListener("click", generateCurriculum);
+  row.appendChild(genBtn);
+  box.appendChild(row);
+
+  wrap.appendChild(box);
+  return wrap;
+}
+
+function CurriculumView() {
+  const wrap = document.createDocumentFragment();
+  const topic = state.topics[state.activeTopicId];
+  if (!topic) { state.view = "home"; return wrap; }
+
+  wrap.appendChild(el("span", { class: "backlink", onclick: () => { state.view = "home"; render(); } }, "← All topics"));
+  wrap.appendChild(el("h2", { class: "curric-title" }, topic.title));
+  wrap.appendChild(el("div", { class: "meta", style: "font-family:-apple-system,sans-serif;font-size:13px;color:#8a8578;" }, `${topic.level} · ${topic.style} style${topic.country ? " · " + topic.country + " examples" : ""} · ${topicProgress(topic)}% complete`));
+
+  const list = el("div", { class: "lesson-list" });
+  topic.lessons.forEach((lesson, idx) => {
+    const row = el("div", { class: "lesson-row" + (lesson.done ? " done" : ""), onclick: () => openLesson(topic.id, idx) }, [
+      el("div", { class: "lesson-num" }, lesson.done ? "✓" : String(idx+1)),
+      el("div", {}, lesson.title)
+    ]);
+    list.appendChild(row);
+  });
+  wrap.appendChild(list);
+  return wrap;
+}
+
+function LessonView() {
+  const wrap = document.createDocumentFragment();
+  const topic = state.topics[state.activeTopicId];
+  if (!topic) { state.view = "home"; return wrap; }
+  const idx = state.activeLessonIndex;
+  const lesson = topic.lessons[idx];
+
+  wrap.appendChild(el("span", { class: "backlink", onclick: () => { state.view = "curriculum"; render(); } }, "← " + topic.title));
+
+  const view = el("div", { class: "lesson-view" });
+  view.appendChild(el("h2", {}, lesson.title));
+
+  if (lesson.content) {
+    if (lesson.imageUrl) {
+      const img = el("img", { class: "lesson-img", src: lesson.imageUrl, alt: lesson.title, loading: "lazy" });
+      img.addEventListener("error", () => { img.style.display = "none"; });
+      view.appendChild(img);
+    }
+    const body = el("div", { class: "lesson-body" });
+    body.innerHTML = lesson.content;
+    view.appendChild(body);
+
+    if (lesson.quiz && lesson.quiz.length) {
+      view.appendChild(el("h3", { style: "font-family:-apple-system,sans-serif;font-size:15px;text-transform:uppercase;letter-spacing:1px;color:var(--moss);margin-top:22px;" }, "Quick check"));
+      lesson.quiz.forEach((q, qi) => {
+        const qBox = el("div", { style: "margin-bottom:14px;" });
+        qBox.appendChild(el("p", { style: "font-weight:600;margin-bottom:6px;" }, q.question));
+        const optWrap = el("div", { style: "display:flex;flex-direction:column;gap:6px;" });
+        q.options.forEach((opt, oi) => {
+          const optBtn = el("button", { class: "btn-ghost", style: "text-align:left;" }, opt);
+          optBtn.addEventListener("click", () => {
+            optBtn.style.background = oi === q.correctIndex ? "#e3efe6" : "#fbeee8";
+            optBtn.insertAdjacentHTML("beforeend", `<div style="font-family:-apple-system,sans-serif;font-size:12px;margin-top:4px;font-weight:400;">${oi===q.correctIndex ? "✓ Correct — " : "✗ "}${q.explanation}</div>`);
+          });
+          optWrap.appendChild(optBtn);
+        });
+        qBox.appendChild(optWrap);
+        view.appendChild(qBox);
+      });
+    }
+
+    if (!lesson.done) {
+      const doneBtn = el("button", { class: "btn-primary", style: "margin-top:16px;" }, "Mark lesson complete");
+      doneBtn.addEventListener("click", () => markLessonDone(topic.id, idx));
+      view.appendChild(doneBtn);
+    }
+
+    // Chat panel
+    const chatPanel = el("div", { class: "chat-panel" });
+    chatPanel.appendChild(el("label", { class: "field-label" }, "Ask about this lesson"));
+    const quick = el("div", { class: "quick-actions" });
+    ["Explain differently", "Give another example", "Go deeper", "Quiz me more"].forEach(qa => {
+      const b = el("button", { class: "btn-ghost" }, qa);
+      b.addEventListener("click", () => sendChat(topic.id, idx, null, qa));
+      quick.appendChild(b);
+    });
+    chatPanel.appendChild(quick);
+
+    const key = topic.id + ":" + idx;
+    const log = state.chatByLesson[key] || [];
+    const logDiv = el("div", { class: "chat-log" });
+    log.forEach(m => {
+      const bubble = el("div", { class: "msg " + m.role });
+      const paras = String(m.text).split(/\n\s*\n/).filter(p => p.trim());
+      if (paras.length <= 1) {
+        bubble.textContent = m.text;
+      } else {
+        paras.forEach(p => bubble.appendChild(el("p", { style: "margin:0 0 8px;" }, p.trim())));
+        bubble.lastChild.style.marginBottom = "0";
+      }
+      logDiv.appendChild(bubble);
+    });
+    chatPanel.appendChild(logDiv);
+
+    const inputRow = el("div", { class: "row" });
+    const chatInput = el("input", { type: "text", placeholder: "Ask a question..." });
+    const sendBtn = el("button", { class: "btn-primary" }, "Send");
+    const doSend = () => { const v = chatInput.value; chatInput.value = ""; sendChat(topic.id, idx, v); };
+    sendBtn.addEventListener("click", doSend);
+    chatInput.addEventListener("keydown", e => { if (e.key === "Enter") doSend(); });
+    inputRow.appendChild(chatInput);
+    inputRow.appendChild(sendBtn);
+    chatPanel.appendChild(inputRow);
+
+    view.appendChild(chatPanel);
+  }
+
+  wrap.appendChild(view);
+  return wrap;
+}
+
+loadTopics();
+</script>
+</body>
+</html>
