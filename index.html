@@ -164,7 +164,7 @@ window.addEventListener("error", (e) => {
 });
 
 // 👇 Paste your Cloudflare Worker URL here after you set it up (see cloudflare-worker.js instructions)
-const WORKER_URL = "https://learn-anything-proxy.sadagopankrishnan.workers.dev/";
+const WORKER_URL = "https://learn-anything-proxy.YOURNAME.workers.dev";
 const API_URL = WORKER_URL;
 // Primary: OpenRouter's own auto-router, always resolves to a currently-live free model.
 // Fallbacks used only if the primary call errors out.
@@ -202,15 +202,15 @@ function render() { App(); }
 
 async function loadTopics() {
   try {
-    const res = await window.storage.get("topics", false);
-    if (res && res.value) state.topics = JSON.parse(res.value);
-  } catch (e) { /* no data yet */ }
+    const raw = localStorage.getItem("learn-anything-topics");
+    if (raw) state.topics = JSON.parse(raw);
+  } catch (e) { /* no data yet, or storage unavailable (e.g. private browsing) */ }
   render();
 }
 
 async function saveTopics() {
   try {
-    await window.storage.set("topics", JSON.stringify(state.topics), false);
+    localStorage.setItem("learn-anything-topics", JSON.stringify(state.topics));
   } catch (e) { console.error("save failed", e); }
 }
 
