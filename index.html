@@ -213,7 +213,9 @@ let state = {
   error: null,
   msgCount: 0,
   quotaUsedToday: 0,
-  quotaDate: null
+  quotaDate: null,
+  streakCount: 0,
+  lastActiveDate: null
 };
 
 function render() { App(); }
@@ -222,8 +224,30 @@ async function loadTopics() {
   try {
     const raw = localStorage.getItem("learn-anything-topics");
     if (raw) state.topics = JSON.parse(raw);
+    const streakRaw = localStorage.getItem("learn-anything-streak");
+    if (streakRaw) {
+      const s = JSON.parse(streakRaw);
+      state.streakCount = s.count || 0;
+      state.lastActiveDate = s.lastDate || null;
+    }
   } catch (e) { /* no data yet, or storage unavailable (e.g. private browsing) */ }
+  updateStreak();
   render();
+}
+
+function updateStreak() {
+  const today = new Date().toDateString();
+  if (state.lastActiveDate === today) return; // already counted today
+  const yesterday = new Date(Date.now() - 86400000).toDateString();
+  if (state.lastActiveDate === yesterday) {
+    state.streakCount += 1; // kept the streak going
+  } else {
+    state.streakCount = 1; // streak broken or first ever visit
+  }
+  state.lastActiveDate = today;
+  try {
+    localStorage.setItem("learn-anything-streak", JSON.stringify({ count: state.streakCount, lastDate: today }));
+  } catch (e) { /* ignore */ }
 }
 
 async function saveTopics() {
@@ -317,6 +341,53 @@ Produce 6 to 9 lessons that form a logical learning sequence from foundational t
   render();
 }
 
+async function openReviewLesson(topicId) {
+  const topic = state.topics[topicId];
+  const weakQuestions = (topic.profile?.weak || []).slice(-8).map(w => w.question);
+  if (weakQuestions.length === 0) return;
+
+  // Create (or reuse) a special review lesson slot at the end of the lessons array
+  let reviewIdx = topic.lessons.findIndex(l => l.isReview);
+  if (reviewIdx === -1) {
+    topic.lessons.push({ title: "Review: your weak spots", isReview: true, content: null, done: false });
+    reviewIdx = topic.lessons.length - 1;
+  } else {
+    topic.lessons[reviewIdx].content = null; // regenerate fresh each time, since weak spots change
+  }
+
+  state.activeTopicId = topicId;
+  state.activeLessonIndex = reviewIdx;
+  state.view = "lesson";
+  state.loading = true;
+  state.loadingMsg = "Building your review...";
+  state.error = null;
+  render();
+
+  const sys = `You are a tutor building a short REVIEW lesson that re-teaches specific concepts a learner has been getting wrong, using a fresh angle (different example/analogy than before) so it clicks this time. Output ONLY valid JSON (no markdown fences) with this shape:
+{"content_html": "string of simple HTML using <p>,<h3>,<ul>,<li>,<strong>,<em> only", "quiz": [{"question":"string","options":["a","b","c","d"],"correctIndex":0,"explanation":"string"}]}
+Keep it short (under 5 minutes to read). Address each concept briefly, then give 2-3 quiz questions re-testing them. Do not use markdown asterisks. Write for a "${topic.level}" learner.`;
+  const user = `Topic: ${topic.title}\nConcepts/questions the learner previously missed:\n${weakQuestions.map((q,i) => (i+1)+". "+q).join("\n")}`;
+
+  try {
+    const result = await callAI([
+      { role: "system", content: sys },
+      { role: "user", content: user }
+    ], { json: true });
+    topic.lessons[reviewIdx].content = result.content_html;
+    topic.lessons[reviewIdx].quiz = (result.quiz || []).map(q => ({
+      ...q,
+      question: cleanText(q.question),
+      options: q.options.map(cleanText),
+      explanation: cleanText(q.explanation)
+    }));
+    await saveTopics();
+  } catch (e) {
+    state.error = friendlyError(e);
+  }
+  state.loading = false;
+  render();
+}
+
 async function openLesson(topicId, idx) {
   state.activeTopicId = topicId;
   state.activeLessonIndex = idx;
@@ -334,9 +405,10 @@ async function openLesson(topicId, idx) {
 
   const priorTitles = topic.lessons.slice(0, idx).map(l => l.title).join(", ") || "none";
   const countryLine = topic.country ? ` Use examples, references, units, currency, and illustrations relevant to ${topic.country} wherever it naturally fits the topic.` : "";
-  const sys = `You are a patient, engaging tutor writing a single self-contained lesson. Output ONLY valid JSON (no markdown fences) with this shape:
+  const memoryLine = profileSummary(topic);
+  const sys = `You are a patient, engaging tutor writing a single self-contained MICRO-LESSON meant to be read in under 5 minutes — think bite-sized daily lesson, not a textbook chapter. Output ONLY valid JSON (no markdown fences) with this shape:
 {"content_html": "string of simple HTML using <p>,<h3>,<ul>,<li>,<strong>,<em> only", "quiz": [{"question":"string","options":["a","b","c","d"],"correctIndex":0,"explanation":"string"}]}
-The content_html should include sections (use <h3> headers): Introduction, an Example, an Analogy, then a short Practice/Summary. Write for a "${topic.level}" learner who prefers a "${topic.style}" style.${countryLine} Include 2-3 quiz questions at the end (in the quiz array, not in content_html). Keep it focused and not too long. Do not use markdown asterisks for bold/italic — use the actual HTML tags instead.`;
+The content_html should include sections (use <h3> headers): Introduction, an Example, an Analogy, then a short Practice/Summary. Keep each section to 2-4 short sentences — total reading time under 5 minutes. Write for a "${topic.level}" learner who prefers a "${topic.style}" style.${countryLine}${memoryLine} Include 2-3 quiz questions at the end (in the quiz array, not in content_html). Do not use markdown asterisks for bold/italic — use the actual HTML tags instead.`;
   const user = `Topic: ${topic.title}\nLesson: "${lesson.title}"\nLessons already covered: ${priorTitles}`;
 
   try {
@@ -365,6 +437,45 @@ function markLessonDone(topicId, idx) {
   state.topics[topicId].lessons[idx].done = true;
   saveTopics();
   render();
+}
+
+// Records right/wrong answers per topic so future lessons and chat can reinforce weak areas.
+// Backward compatible: old saved topics won't have this field until their first new answer.
+function recordQuizAnswer(topicId, lessonTitle, question, wasCorrect) {
+  const topic = state.topics[topicId];
+  if (!topic.profile) topic.profile = { weak: [], strong: [] };
+  const entry = { lesson: lessonTitle, question, at: Date.now() };
+  if (wasCorrect) {
+    topic.profile.strong.push(entry);
+    // if they'd previously missed this same question, clear it from weak list — they've got it now
+    topic.profile.weak = topic.profile.weak.filter(w => w.question !== question);
+  } else {
+    // avoid duplicate entries for the same question
+    if (!topic.profile.weak.some(w => w.question === question)) topic.profile.weak.push(entry);
+  }
+  // keep lists from growing unbounded
+  topic.profile.weak = topic.profile.weak.slice(-15);
+  topic.profile.strong = topic.profile.strong.slice(-30);
+  saveTopics();
+}
+
+// Turns a topic's tracked performance into a short line for AI prompts.
+function profileSummary(topic) {
+  const p = topic.profile;
+  if (!p || (p.weak.length === 0 && p.strong.length === 0)) return "";
+  const weakLine = p.weak.length
+    ? `The learner has struggled with: ${p.weak.slice(-6).map(w => w.question).join("; ")}. Reinforce these concepts naturally where relevant, without calling out that they got them wrong before.`
+    : "";
+  const paceLine = p.strong.length >= 4 && p.weak.length === 0
+    ? " This learner has been answering confidently — feel free to move a bit faster and go slightly deeper."
+    : "";
+  return " " + weakLine + paceLine;
+}
+
+function weakConceptTitles(topic) {
+  if (!topic.profile || !topic.profile.weak.length) return [];
+  // unique lesson titles that have an open weak spot
+  return [...new Set(topic.profile.weak.map(w => w.lesson))];
 }
 
 async function sendChat(topicId, idx, text, quickAction) {
@@ -452,7 +563,7 @@ function App() {
 
   const header = el("header", { class: "top" }, [
     el("h1", {}, "Learn Anything"),
-    el("span", { class: "tag" }, "personal edition")
+    el("span", { class: "tag" }, state.streakCount > 0 ? `🔥 ${state.streakCount} day${state.streakCount===1?"":"s"}` : "personal edition")
   ]);
   root.appendChild(header);
 
@@ -585,6 +696,14 @@ function CurriculumView() {
     list.appendChild(row);
   });
   wrap.appendChild(list);
+
+  const weak = weakConceptTitles(topic);
+  if (weak.length > 0) {
+    const reviewBtn = el("button", { class: "btn-ghost", style: "margin-top:16px;" },
+      `🔄 Review what you've missed (${weak.length} concept${weak.length===1?"":"s"})`);
+    reviewBtn.addEventListener("click", () => openReviewLesson(topic.id));
+    wrap.appendChild(reviewBtn);
+  }
   return wrap;
 }
 
@@ -621,6 +740,7 @@ function LessonView() {
           optBtn.addEventListener("click", () => {
             optBtn.style.background = oi === q.correctIndex ? "#e3efe6" : "#fbeee8";
             optBtn.insertAdjacentHTML("beforeend", `<div style="font-family:-apple-system,sans-serif;font-size:12px;margin-top:4px;font-weight:400;">${oi===q.correctIndex ? "✓ Correct — " : "✗ "}${q.explanation}</div>`);
+            recordQuizAnswer(topic.id, lesson.title, q.question, oi === q.correctIndex);
           });
           optWrap.appendChild(optBtn);
         });
