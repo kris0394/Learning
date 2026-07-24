@@ -185,6 +185,17 @@ const FALLBACK_MODEL_CANDIDATES = [
 ];
 let liveFreeModels = null; // populated on first use, cached for the session
 
+// Rough speed heuristic: smaller models (by params hinted in the id) respond faster.
+// We don't have real latency data client-side, so this is a best-effort ordering,
+// not a guarantee — quality still comes from whichever model actually answers.
+function bySpeedHint(ids) {
+  const sizeOf = (id) => {
+    const m = id.match(/(\d+)(b|B)(?!.*\d)/); // e.g. "8b", "70b" — last size-like token
+    return m ? parseInt(m[1], 10) : 999; // unknown size sorts last (assume it's a big/slow one)
+  };
+  return [...ids].sort((a, b) => sizeOf(a) - sizeOf(b));
+}
+
 async function getFreeModelList() {
   if (liveFreeModels) return liveFreeModels;
   try {
@@ -195,8 +206,9 @@ async function getFreeModelList() {
         parseFloat(m.pricing?.prompt || "1") === 0 &&
         parseFloat(m.pricing?.completion || "1") === 0)
       .map(m => m.id);
-    // Put the auto-router first (it self-selects a working free model), then real ones as backup
-    liveFreeModels = ["openrouter/free", ...free.slice(0, 6)];
+    const fastFirst = bySpeedHint(free).slice(0, 6);
+    // Auto-router first (self-selects a live free model), then fastest-looking real ones as backup
+    liveFreeModels = ["openrouter/free", ...fastFirst];
     if (liveFreeModels.length <= 1) liveFreeModels = FALLBACK_MODEL_CANDIDATES;
   } catch (e) {
     liveFreeModels = FALLBACK_MODEL_CANDIDATES;
@@ -344,6 +356,7 @@ Produce 6 to 9 lessons that form a logical learning sequence from foundational t
     await saveTopics();
     state.activeTopicId = id;
     state.view = "curriculum";
+    prefetchNextLesson({ ...state.topics[id], id }, -1); // starts lesson 1 generating silently while they view the curriculum list
     state.newTopicDraft = { title: "", level: "Beginner", style: "examples", country: draft.country, step: 1 };
   } catch (e) {
     state.error = friendlyError(e);
@@ -399,6 +412,48 @@ Keep it short (under 5 minutes to read). Address each concept briefly, then give
   render();
 }
 
+async function generateLessonContent(topic, lesson, idx) {
+  const priorTitles = topic.lessons.slice(0, idx).map(l => l.title).join(", ") || "none";
+  const countryLine = topic.country ? ` Use examples, references, units, currency, and illustrations relevant to ${topic.country} wherever it naturally fits the topic.` : "";
+  const memoryLine = profileSummary(topic);
+  const sys = `You are a patient, engaging tutor writing a single self-contained MICRO-LESSON meant to be read in under 5 minutes — think bite-sized daily lesson, not a textbook chapter. Output ONLY valid JSON (no markdown fences) with this shape:
+{"content_html": "string of simple HTML using <p>,<h3>,<ul>,<li>,<strong>,<em> only", "quiz": [{"question":"string","options":["a","b","c","d"],"correctIndex":0,"explanation":"string"}]}
+The content_html should include sections (use <h3> headers): Introduction, an Example, an Analogy, then a short Practice/Summary. Keep each section to 2-4 short sentences — total reading time under 5 minutes. Write for a "${topic.level}" learner who prefers a "${topic.style}" style.${countryLine}${memoryLine} Include 2-3 quiz questions at the end (in the quiz array, not in content_html). Do not use markdown asterisks for bold/italic — use the actual HTML tags instead.`;
+  const user = `Topic: ${topic.title}\nLesson: "${lesson.title}"\nLessons already covered: ${priorTitles}`;
+
+  const result = await callAI([
+    { role: "system", content: sys },
+    { role: "user", content: user }
+  ], { json: true });
+
+  lesson.content = result.content_html;
+  lesson.quiz = (result.quiz || []).map(q => ({
+    ...q,
+    question: cleanText(q.question),
+    options: q.options.map(cleanText),
+    explanation: cleanText(q.explanation)
+  }));
+  lesson.imageUrl = await fetchLessonImage(topic.title + " " + lesson.title); // free, keyless, no AI cost
+  await saveTopics();
+}
+
+let prefetchInFlight = new Set(); // guards against double-prefetching the same lesson
+
+// Silently generates the next lesson in the background while the learner is still
+// reading the current one. Never touches loading/error state — if it fails, the
+// lesson simply generates normally (visibly) whenever they actually open it.
+function prefetchNextLesson(topic, idx) {
+  const nextIdx = idx + 1;
+  const next = topic.lessons[nextIdx];
+  const key = topic.id + ":" + nextIdx;
+  if (!next || next.content || prefetchInFlight.has(key)) return;
+  prefetchInFlight.add(key);
+  generateLessonContent(topic, next, nextIdx)
+    .then(() => render()) // updates the curriculum list's cached state quietly; no loading UI shown
+    .catch(() => { /* silent — will just generate normally on demand later */ })
+    .finally(() => prefetchInFlight.delete(key));
+}
+
 async function openLesson(topicId, idx) {
   state.activeTopicId = topicId;
   state.activeLessonIndex = idx;
@@ -411,35 +466,18 @@ async function openLesson(topicId, idx) {
   render();
 
   const lesson = topic.lessons[idx];
-  if (lesson.content) return; // cached, no API call
+  if (lesson.content) {
+    prefetchNextLesson(topic, idx); // already cached — get a head start on the one after
+    return;
+  }
 
   state.loading = true;
   state.loadingMsg = "Writing this lesson...";
   render();
 
-  const priorTitles = topic.lessons.slice(0, idx).map(l => l.title).join(", ") || "none";
-  const countryLine = topic.country ? ` Use examples, references, units, currency, and illustrations relevant to ${topic.country} wherever it naturally fits the topic.` : "";
-  const memoryLine = profileSummary(topic);
-  const sys = `You are a patient, engaging tutor writing a single self-contained MICRO-LESSON meant to be read in under 5 minutes — think bite-sized daily lesson, not a textbook chapter. Output ONLY valid JSON (no markdown fences) with this shape:
-{"content_html": "string of simple HTML using <p>,<h3>,<ul>,<li>,<strong>,<em> only", "quiz": [{"question":"string","options":["a","b","c","d"],"correctIndex":0,"explanation":"string"}]}
-The content_html should include sections (use <h3> headers): Introduction, an Example, an Analogy, then a short Practice/Summary. Keep each section to 2-4 short sentences — total reading time under 5 minutes. Write for a "${topic.level}" learner who prefers a "${topic.style}" style.${countryLine}${memoryLine} Include 2-3 quiz questions at the end (in the quiz array, not in content_html). Do not use markdown asterisks for bold/italic — use the actual HTML tags instead.`;
-  const user = `Topic: ${topic.title}\nLesson: "${lesson.title}"\nLessons already covered: ${priorTitles}`;
-
   try {
-    const result = await callAI([
-      { role: "system", content: sys },
-      { role: "user", content: user }
-    ], { json: true });
-    lesson.content = result.content_html;
-    lesson.quiz = (result.quiz || []).map(q => ({
-      ...q,
-      question: cleanText(q.question),
-      options: q.options.map(cleanText),
-      explanation: cleanText(q.explanation)
-    }));
-    // Free, keyless image lookup (Wikipedia) — does not count toward AI exchanges
-    lesson.imageUrl = await fetchLessonImage(topic.title + " " + lesson.title);
-    await saveTopics();
+    await generateLessonContent(topic, lesson, idx);
+    prefetchNextLesson(topic, idx); // now that this one's done, quietly start the next
   } catch (e) {
     state.error = friendlyError(e);
   }
