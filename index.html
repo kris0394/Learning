@@ -122,6 +122,17 @@
   .quick-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
 
   .loading { font-family: -apple-system, sans-serif; color: #8a8578; font-size: 14px; padding: 20px 0; }
+  .loading-skel {
+    display: flex; align-items: center; gap: 10px; font-family: -apple-system, sans-serif;
+    color: #8a8578; font-size: 14px; padding: 20px 0;
+  }
+  .spinner {
+    width: 16px; height: 16px; border: 2px solid var(--line); border-top-color: var(--moss);
+    border-radius: 50%; animation: spin 0.7s linear infinite; flex-shrink: 0;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .app > *:not(header) { animation: fadeIn 0.2s ease; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
   .error-box {
     background: #fbeee8; border: 1px solid var(--clay); color: #7a3a20; padding: 12px 14px;
     border-radius: 5px; font-family: -apple-system, sans-serif; font-size: 13.5px; margin: 14px 0;
@@ -206,7 +217,7 @@ let state = {
   topics: {},          // id -> {id,title,level,style,country,lessons:[{title,content,quiz,done,imageUrl}], activeIndex, createdAt}
   activeTopicId: null,
   activeLessonIndex: null,
-  newTopicDraft: { title: "", level: "Beginner", style: "examples", country: "Global / none" },
+  newTopicDraft: { title: "", level: "Beginner", style: "examples", country: "Global / none", step: 1 },
   chatByLesson: {},    // "topicId:lessonIdx" -> [{role,text}]
   loading: false,
   loadingMsg: "",
@@ -333,7 +344,7 @@ Produce 6 to 9 lessons that form a logical learning sequence from foundational t
     await saveTopics();
     state.activeTopicId = id;
     state.view = "curriculum";
-    state.newTopicDraft = { title: "", level: "Beginner", style: "examples", country: draft.country };
+    state.newTopicDraft = { title: "", level: "Beginner", style: "examples", country: draft.country, step: 1 };
   } catch (e) {
     state.error = friendlyError(e);
   }
@@ -393,9 +404,12 @@ async function openLesson(topicId, idx) {
   state.activeLessonIndex = idx;
   state.view = "lesson";
   state.error = null;
+  const topic = state.topics[topicId];
+  topic.lastOpenedIndex = idx;
+  topic.lastOpenedAt = Date.now();
+  saveTopics();
   render();
 
-  const topic = state.topics[topicId];
   const lesson = topic.lessons[idx];
   if (lesson.content) return; // cached, no API call
 
@@ -580,7 +594,10 @@ function App() {
   }
 
   if (state.loading) {
-    root.appendChild(el("div", { class: "loading" }, "⏳ " + state.loadingMsg));
+    root.appendChild(el("div", { class: "loading-skel" }, [
+      el("div", { class: "spinner" }),
+      el("span", {}, state.loadingMsg)
+    ]));
   }
 
   if (state.view === "home") root.appendChild(HomeView());
@@ -604,9 +621,29 @@ function el(tag, attrs, children) {
 
 function HomeView() {
   const wrap = document.createDocumentFragment();
-  const grid = el("div", { class: "home-grid" });
   const topics = Object.values(state.topics).sort((a,b) => b.createdAt - a.createdAt);
 
+  const withActivity = topics.filter(t => t.lastOpenedAt).sort((a,b) => b.lastOpenedAt - a.lastOpenedAt);
+  if (withActivity.length > 0) {
+    const t = withActivity[0];
+    const idx = Math.min(t.lastOpenedIndex ?? 0, t.lessons.length - 1);
+    const lesson = t.lessons[idx];
+    const continueCard = el("div", {
+      class: "topic-card",
+      style: "background:var(--moss);color:white;border:none;margin-bottom:18px;",
+      onclick: () => openLesson(t.id, idx)
+    }, [
+      el("div", {}, [
+        el("div", { style: "font-family:-apple-system,sans-serif;font-size:11px;text-transform:uppercase;letter-spacing:1px;opacity:0.85;margin-bottom:4px;" }, "Continue learning"),
+        el("h3", { style: "margin:0 0 2px;color:white;" }, t.title),
+        el("div", { class: "meta", style: "color:rgba(255,255,255,0.8);" }, lesson.title)
+      ]),
+      el("span", { style: "font-size:20px;" }, "→")
+    ]);
+    wrap.appendChild(continueCard);
+  }
+
+  const grid = el("div", { class: "home-grid" });
   if (topics.length === 0) {
     grid.appendChild(el("div", { class: "loading" }, "No topics yet — start one below."));
   }
@@ -626,53 +663,93 @@ function HomeView() {
   });
   wrap.appendChild(grid);
 
-  const startBtn = el("button", { class: "btn-primary", onclick: () => { state.view = "new"; render(); } }, "+ Start a new topic");
+  const startBtn = el("button", { class: "btn-primary", onclick: () => { state.newTopicDraft.step = 1; state.view = "new"; render(); } }, "+ Start a new topic");
   wrap.appendChild(startBtn);
   return wrap;
 }
 
 function NewTopicView() {
   const wrap = document.createDocumentFragment();
-  wrap.appendChild(el("span", { class: "backlink", onclick: () => { state.view = "home"; render(); } }, "← Back"));
+  const step = state.newTopicDraft.step || 1;
+  const totalSteps = 4;
+
+  wrap.appendChild(el("span", { class: "backlink", onclick: () => {
+    if (step > 1) { state.newTopicDraft.step = step - 1; render(); }
+    else { state.view = "home"; render(); }
+  } }, "← Back"));
+
+  const stepper = el("div", { style: "font-family:-apple-system,sans-serif;font-size:12px;color:#8a8578;margin-bottom:10px;" }, `Step ${step} of ${totalSteps}`);
+  wrap.appendChild(stepper);
 
   const box = el("div", { class: "new-topic-box" });
-  box.appendChild(el("h2", {}, "What do you want to learn?"));
 
-  const input = el("input", { type: "text", value: state.newTopicDraft.title, placeholder: "e.g. Comparative religion, Roman history, guitar..." });
-  input.value = state.newTopicDraft.title;
-  input.addEventListener("input", e => { state.newTopicDraft.title = e.target.value; });
-  box.appendChild(input);
+  if (step === 1) {
+    box.appendChild(el("h2", {}, "What do you want to learn?"));
+    const input = el("input", { type: "text", placeholder: "e.g. Comparative religion, Roman history, guitar..." });
+    input.value = state.newTopicDraft.title;
+    input.addEventListener("input", e => { state.newTopicDraft.title = e.target.value; });
+    box.appendChild(input);
+    const row = el("div", { class: "row" });
+    const next = el("button", { class: "btn-primary" }, "Next");
+    next.addEventListener("click", () => {
+      if (!state.newTopicDraft.title.trim()) return;
+      state.newTopicDraft.step = 2; render();
+    });
+    row.appendChild(next);
+    box.appendChild(row);
 
-  box.appendChild(el("label", { class: "field-label" }, "Your level"));
-  const levels = ["Never heard of it", "Beginner", "Intermediate", "Advanced", "Expert"];
-  const levelGroup = el("div", { class: "chip-group" });
-  levels.forEach(lv => {
-    const chip = el("div", { class: "chip" + (state.newTopicDraft.level === lv ? " selected" : ""), onclick: () => { state.newTopicDraft.level = lv; render(); } }, lv);
-    levelGroup.appendChild(chip);
-  });
-  box.appendChild(levelGroup);
+  } else if (step === 2) {
+    box.appendChild(el("h2", {}, `How familiar are you with ${state.newTopicDraft.title}?`));
+    const levels = ["Never heard of it", "Beginner", "Intermediate", "Advanced", "Expert"];
+    const levelGroup = el("div", { class: "chip-group" });
+    levels.forEach(lv => {
+      const chip = el("div", { class: "chip" + (state.newTopicDraft.level === lv ? " selected" : ""), onclick: () => { state.newTopicDraft.level = lv; render(); } }, lv);
+      levelGroup.appendChild(chip);
+    });
+    box.appendChild(levelGroup);
+    const row = el("div", { class: "row" });
+    const next = el("button", { class: "btn-primary" }, "Next");
+    next.addEventListener("click", () => { state.newTopicDraft.step = 3; render(); });
+    row.appendChild(next);
+    box.appendChild(row);
 
-  box.appendChild(el("label", { class: "field-label" }, "Learning style"));
-  const styles = ["stories", "examples", "analogies", "practical", "project-based", "visuals"];
-  const styleGroup = el("div", { class: "chip-group" });
-  styles.forEach(s => {
-    const chip = el("div", { class: "chip" + (state.newTopicDraft.style === s ? " selected" : ""), onclick: () => { state.newTopicDraft.style = s; render(); } }, s);
-    styleGroup.appendChild(chip);
-  });
-  box.appendChild(styleGroup);
+  } else if (step === 3) {
+    box.appendChild(el("h2", {}, "How do you learn best?"));
+    const styles = ["stories", "examples", "analogies", "practical", "project-based", "visuals"];
+    const styleGroup = el("div", { class: "chip-group" });
+    styles.forEach(s => {
+      const chip = el("div", { class: "chip" + (state.newTopicDraft.style === s ? " selected" : ""), onclick: () => { state.newTopicDraft.style = s; render(); } }, s);
+      styleGroup.appendChild(chip);
+    });
+    box.appendChild(styleGroup);
+    box.appendChild(el("label", { class: "field-label" }, "Your country (optional — tailors examples & illustrations)"));
+    const countryInput = el("input", { type: "text", placeholder: "e.g. India, Nigeria, Brazil..." });
+    countryInput.value = state.newTopicDraft.country;
+    countryInput.addEventListener("input", e => { state.newTopicDraft.country = e.target.value; });
+    box.appendChild(countryInput);
+    const row = el("div", { class: "row" });
+    const next = el("button", { class: "btn-primary" }, "Next");
+    next.addEventListener("click", () => { state.newTopicDraft.step = 4; render(); });
+    row.appendChild(next);
+    box.appendChild(row);
 
-  box.appendChild(el("label", { class: "field-label" }, "Your country (optional — tailors examples & illustrations)"));
-  const countryInput = el("input", { type: "text", placeholder: "e.g. India, Nigeria, Brazil..." });
-  countryInput.value = state.newTopicDraft.country;
-  countryInput.addEventListener("input", e => { state.newTopicDraft.country = e.target.value; });
-  box.appendChild(countryInput);
-
-  const row = el("div", { class: "row" });
-  const genBtn = el("button", { class: "btn-primary" }, "Generate curriculum");
-  genBtn.disabled = state.loading;
-  genBtn.addEventListener("click", generateCurriculum);
-  row.appendChild(genBtn);
-  box.appendChild(row);
+  } else if (step === 4) {
+    box.appendChild(el("h2", {}, "Ready to build your curriculum"));
+    const d = state.newTopicDraft;
+    const summary = el("div", { style: "font-family:-apple-system,sans-serif;font-size:14px;color:#4a463c;line-height:1.8;margin-bottom:16px;" }, [
+      el("div", {}, `📚 Topic: ${d.title}`),
+      el("div", {}, `🎯 Level: ${d.level}`),
+      el("div", {}, `🎨 Style: ${d.style}`),
+      d.country ? el("div", {}, `🌍 Examples from: ${d.country}`) : null
+    ]);
+    box.appendChild(summary);
+    const row = el("div", { class: "row" });
+    const genBtn = el("button", { class: "btn-primary" }, "Generate curriculum");
+    genBtn.disabled = state.loading;
+    genBtn.addEventListener("click", generateCurriculum);
+    row.appendChild(genBtn);
+    box.appendChild(row);
+  }
 
   wrap.appendChild(box);
   return wrap;
@@ -729,6 +806,7 @@ function LessonView() {
     body.innerHTML = lesson.content;
     view.appendChild(body);
 
+    let quizResults = []; // track this viewing's answers to decide on adaptive bridge lesson
     if (lesson.quiz && lesson.quiz.length) {
       view.appendChild(el("h3", { style: "font-family:-apple-system,sans-serif;font-size:15px;text-transform:uppercase;letter-spacing:1px;color:var(--moss);margin-top:22px;" }, "Quick check"));
       lesson.quiz.forEach((q, qi) => {
@@ -738,9 +816,11 @@ function LessonView() {
         q.options.forEach((opt, oi) => {
           const optBtn = el("button", { class: "btn-ghost", style: "text-align:left;" }, opt);
           optBtn.addEventListener("click", () => {
-            optBtn.style.background = oi === q.correctIndex ? "#e3efe6" : "#fbeee8";
-            optBtn.insertAdjacentHTML("beforeend", `<div style="font-family:-apple-system,sans-serif;font-size:12px;margin-top:4px;font-weight:400;">${oi===q.correctIndex ? "✓ Correct — " : "✗ "}${q.explanation}</div>`);
-            recordQuizAnswer(topic.id, lesson.title, q.question, oi === q.correctIndex);
+            const correct = oi === q.correctIndex;
+            optBtn.style.background = correct ? "#e3efe6" : "#fbeee8";
+            optBtn.insertAdjacentHTML("beforeend", `<div style="font-family:-apple-system,sans-serif;font-size:12px;margin-top:4px;font-weight:400;">${correct ? "✓ Correct — " : "✗ "}${q.explanation}</div>`);
+            recordQuizAnswer(topic.id, lesson.title, q.question, correct);
+            quizResults[qi] = correct;
           });
           optWrap.appendChild(optBtn);
         });
@@ -751,7 +831,16 @@ function LessonView() {
 
     if (!lesson.done) {
       const doneBtn = el("button", { class: "btn-primary", style: "margin-top:16px;" }, "Mark lesson complete");
-      doneBtn.addEventListener("click", () => markLessonDone(topic.id, idx));
+      doneBtn.addEventListener("click", () => {
+        const answered = quizResults.filter(r => r !== undefined);
+        const correctCount = answered.filter(Boolean).length;
+        const scoreLow = answered.length > 0 && (correctCount / answered.length) < 0.5;
+        markLessonDone(topic.id, idx);
+        if (scoreLow && !lesson.isReview) {
+          state.error = null;
+          openReviewLesson(topic.id); // adaptive: low score triggers an immediate targeted bridge lesson
+        }
+      });
       view.appendChild(doneBtn);
     }
 
