@@ -14,6 +14,18 @@
     --line: #d9d3c4;
     --card: #ffffff;
   }
+  body.dark {
+    --ink: #e8e6df;
+    --paper: #1a1d19;
+    --moss: #6ea67e;
+    --moss-dark: #8ec49b;
+    --clay: #d68a63;
+    --line: #333830;
+    --card: #23271f;
+  }
+  body.dark .chip { background: var(--card); color: var(--ink); }
+  body.dark input[type=text] { background: var(--card); color: var(--ink); border-color: var(--line); }
+  body { transition: background-color 0.2s, color 0.2s; }
   * { box-sizing: border-box; }
   body {
     margin: 0;
@@ -176,6 +188,25 @@ window.addEventListener("error", (e) => {
 
 // 👇 Paste your Cloudflare Worker URL here after you set it up (see cloudflare-worker.js instructions)
 const WORKER_URL = "https://learn-anything-proxy.sadagopankrishnan.workers.dev";
+
+// --- Lightweight, anonymous usage analytics (helps you see how testers use the app) ---
+function getDeviceId() {
+  let id = localStorage.getItem("learn-anything-device-id");
+  if (!id) {
+    id = "d_" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    localStorage.setItem("learn-anything-device-id", id);
+  }
+  return id;
+}
+function track(type, extra = {}) {
+  try {
+    fetch(WORKER_URL + "/event", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type, deviceId: getDeviceId(), clientTime: Date.now(), ...extra })
+    }).catch(() => {}); // never let analytics affect the app
+  } catch (e) { /* ignore */ }
+}
 const API_URL = WORKER_URL;
 // Static safety net, used only if the live model list can't be fetched at all.
 const FALLBACK_MODEL_CANDIDATES = [
@@ -271,6 +302,7 @@ function updateStreak() {
   try {
     localStorage.setItem("learn-anything-streak", JSON.stringify({ count: state.streakCount, lastDate: today }));
   } catch (e) { /* ignore */ }
+  track("daily_open", { streak: state.streakCount });
 }
 
 async function saveTopics() {
@@ -356,6 +388,7 @@ Produce 6 to 9 lessons that form a logical learning sequence from foundational t
     await saveTopics();
     state.activeTopicId = id;
     state.view = "curriculum";
+    track("topic_created", { topic: draft.title.trim(), level: draft.level, style: draft.style });
     prefetchNextLesson({ ...state.topics[id], id }, -1); // starts lesson 1 generating silently while they view the curriculum list
     state.newTopicDraft = { title: "", level: "Beginner", style: "examples", country: draft.country, step: 1 };
   } catch (e) {
@@ -405,6 +438,54 @@ Keep it short (under 5 minutes to read). Address each concept briefly, then give
       explanation: cleanText(q.explanation)
     }));
     await saveTopics();
+  } catch (e) {
+    state.error = friendlyError(e);
+  }
+  state.loading = false;
+  render();
+}
+
+async function openDailyReview(topicId) {
+  const topic = state.topics[topicId];
+  const due = dueForReview(topic);
+  if (due.length === 0) return;
+  const questions = due.map(d => d.question);
+
+  let reviewIdx = topic.lessons.findIndex(l => l.isDailyReview);
+  if (reviewIdx === -1) {
+    topic.lessons.push({ title: "Daily Review", isDailyReview: true, content: null, done: false });
+    reviewIdx = topic.lessons.length - 1;
+  } else {
+    topic.lessons[reviewIdx].content = null;
+  }
+
+  state.activeTopicId = topicId;
+  state.activeLessonIndex = reviewIdx;
+  state.view = "lesson";
+  state.loading = true;
+  state.loadingMsg = "Building your daily review...";
+  state.error = null;
+  render();
+
+  const sys = `You are a tutor running a quick SPACED-REPETITION review — the learner already knows these concepts well, this is just a light refresher quiz to keep them sharp, not a re-teaching session. Output ONLY valid JSON (no markdown fences) with this shape:
+{"content_html": "string of simple HTML using <p>,<h3>,<ul>,<li>,<strong>,<em> only", "quiz": [{"question":"string","options":["a","b","c","d"],"correctIndex":0,"explanation":"string"}]}
+content_html should be a short 2-3 sentence friendly intro only ("Let's make sure this is still sticking..."), not a full lesson. Then include a quiz question for EACH concept listed below, worded a little differently than before so it's not just rote recall. Do not use markdown asterisks.`;
+  const user = `Topic: ${topic.title}\nConcepts to briefly re-test:\n${questions.map((q,i) => (i+1)+". "+q).join("\n")}`;
+
+  try {
+    const result = await callAI([
+      { role: "system", content: sys },
+      { role: "user", content: user }
+    ], { json: true });
+    topic.lessons[reviewIdx].content = result.content_html;
+    topic.lessons[reviewIdx].quiz = (result.quiz || []).map(q => ({
+      ...q,
+      question: cleanText(q.question),
+      options: q.options.map(cleanText),
+      explanation: cleanText(q.explanation)
+    }));
+    await saveTopics();
+    track("daily_review_opened", { topic: topic.title, count: questions.length });
   } catch (e) {
     state.error = friendlyError(e);
   }
@@ -489,8 +570,10 @@ async function openLesson(topicId, idx) {
 }
 
 function markLessonDone(topicId, idx) {
-  state.topics[topicId].lessons[idx].done = true;
+  const topic = state.topics[topicId];
+  topic.lessons[idx].done = true;
   saveTopics();
+  track("lesson_completed", { topic: topic.title, lesson: topic.lessons[idx].title });
   render();
 }
 
@@ -531,6 +614,24 @@ function weakConceptTitles(topic) {
   if (!topic.profile || !topic.profile.weak.length) return [];
   // unique lesson titles that have an open weak spot
   return [...new Set(topic.profile.weak.map(w => w.lesson))];
+}
+
+// Spaced repetition: things answered correctly are "due" for a refresher review
+// after a few days, so they move to long-term memory instead of fading.
+const REVIEW_DUE_AFTER_MS = 3 * 24 * 60 * 60 * 1000; // 3 days
+function dueForReview(topic) {
+  const p = topic.profile;
+  if (!p || !p.strong.length) return [];
+  const cutoff = Date.now() - REVIEW_DUE_AFTER_MS;
+  // Keep only the most recent correct-answer timestamp per question
+  const latestByQuestion = {};
+  for (const s of p.strong) {
+    if (!latestByQuestion[s.question] || s.at > latestByQuestion[s.question].at) latestByQuestion[s.question] = s;
+  }
+  return Object.values(latestByQuestion).filter(s => s.at < cutoff).slice(-8);
+}
+function anyTopicDueForReview() {
+  return Object.values(state.topics).find(t => dueForReview(t).length > 0) || null;
 }
 
 async function sendChat(topicId, idx, text, quickAction) {
@@ -616,9 +717,13 @@ function App() {
   const root = document.getElementById("root");
   root.innerHTML = "";
 
+  const isDark = document.body.classList.contains("dark");
   const header = el("header", { class: "top" }, [
     el("h1", {}, "Learn Anything"),
-    el("span", { class: "tag" }, state.streakCount > 0 ? `🔥 ${state.streakCount} day${state.streakCount===1?"":"s"}` : "personal edition")
+    el("div", { style: "display:flex;align-items:center;gap:10px;" }, [
+      el("span", { class: "tag" }, state.streakCount > 0 ? `🔥 ${state.streakCount} day${state.streakCount===1?"":"s"}` : "personal edition"),
+      el("button", { onclick: toggleTheme, style: "background:none;border:1px solid var(--line);border-radius:50%;width:30px;height:30px;font-size:14px;padding:0;cursor:pointer;" }, isDark ? "☀️" : "🌙")
+    ])
   ]);
   root.appendChild(header);
 
@@ -663,6 +768,24 @@ function el(tag, attrs, children) {
 function HomeView() {
   const wrap = document.createDocumentFragment();
   const topics = Object.values(state.topics).sort((a,b) => b.createdAt - a.createdAt);
+
+  const reviewTopic = anyTopicDueForReview();
+  if (reviewTopic) {
+    const dueCount = dueForReview(reviewTopic).length;
+    const reviewCard = el("div", {
+      class: "topic-card",
+      style: "background:var(--clay);color:white;border:none;margin-bottom:14px;",
+      onclick: () => openDailyReview(reviewTopic.id)
+    }, [
+      el("div", {}, [
+        el("div", { style: "font-family:-apple-system,sans-serif;font-size:11px;text-transform:uppercase;letter-spacing:1px;opacity:0.85;margin-bottom:4px;" }, "🧠 Daily review ready"),
+        el("h3", { style: "margin:0 0 2px;color:white;" }, reviewTopic.title),
+        el("div", { class: "meta", style: "color:rgba(255,255,255,0.85);" }, `${dueCount} concept${dueCount===1?"":"s"} to keep sharp`)
+      ]),
+      el("span", { style: "font-size:20px;" }, "→")
+    ]);
+    wrap.appendChild(reviewCard);
+  }
 
   const withActivity = topics.filter(t => t.lastOpenedAt).sort((a,b) => b.lastOpenedAt - a.lastOpenedAt);
   if (withActivity.length > 0) {
@@ -872,6 +995,7 @@ function LessonView() {
             optBtn.style.background = correct ? "#e3efe6" : "#fbeee8";
             optBtn.insertAdjacentHTML("beforeend", `<div style="font-family:-apple-system,sans-serif;font-size:12px;margin-top:4px;font-weight:400;">${correct ? "✓ Correct — " : "✗ "}${q.explanation}</div>`);
             recordQuizAnswer(topic.id, lesson.title, q.question, correct);
+            track("quiz_answered", { topic: topic.title, correct });
             quizResults[qi] = correct;
           });
           optWrap.appendChild(optBtn);
@@ -940,6 +1064,18 @@ function LessonView() {
   return wrap;
 }
 
+function applyTheme() {
+  const saved = localStorage.getItem("learn-anything-theme");
+  const dark = saved ? saved === "dark" : window.matchMedia("(prefers-color-scheme: dark)").matches;
+  document.body.classList.toggle("dark", dark);
+}
+function toggleTheme() {
+  const isDark = document.body.classList.contains("dark");
+  document.body.classList.toggle("dark", !isDark);
+  localStorage.setItem("learn-anything-theme", !isDark ? "dark" : "light");
+  render();
+}
+applyTheme();
 loadTopics();
 </script>
 </body>
