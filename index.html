@@ -354,7 +354,7 @@ function cleanText(s) {
     .trim();
 }
 
-async function callAI(messages, { json = false } = {}) {
+async function callAI(messages, { json = false, maxTokens = 900 } = {}) {
   bumpMsgCount();
   let lastErr = null;
   const candidates = await getFreeModelList();
@@ -363,7 +363,7 @@ async function callAI(messages, { json = false } = {}) {
       const res = await fetch(API_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model, messages, temperature: 0.7 })
+        body: JSON.stringify({ model, messages, temperature: 0.7, max_tokens: maxTokens })
       });
       if (!res.ok) {
         const t = await res.text().catch(()=> "");
@@ -405,7 +405,7 @@ Produce 6 to 9 lessons that form a logical learning sequence from foundational t
     const result = await callAI([
       { role: "system", content: sys },
       { role: "user", content: user }
-    ], { json: true });
+    ], { json: true, maxTokens: 500 });
 
     const id = "t_" + Date.now();
     state.topics[id] = {
@@ -529,6 +529,18 @@ async function generateLessonContent(topic, lesson, idx) {
   const priorTitles = topic.lessons.slice(0, idx).map(l => l.title).join(", ") || "none";
   const countryLine = topic.country ? ` Use examples, references, units, currency, and illustrations relevant to ${topic.country} wherever it naturally fits the topic.` : "";
   const memoryLine = profileSummary(topic);
+  const searchQuery = topic.title + " " + lesson.title;
+
+  // Kick off everything independent of the AI text call in parallel, instead of waiting on each in sequence.
+  const imagePromise = fetchLessonImage(searchQuery);
+  const readingPromise = fetchFurtherReading(searchQuery);
+  const groundingPromise = fetchWikiExtract(searchQuery); // real current text, used to ground the lesson in facts
+
+  const groundingText = await groundingPromise;
+  const groundingLine = groundingText
+    ? `\n\nHere is a current, factual reference extract to ground this lesson's facts in (paraphrase, don't copy verbatim, and only use what's actually relevant to this specific lesson):\n"""${groundingText}"""`
+    : "";
+
   const sys = `You are a patient, engaging tutor writing a single self-contained MICRO-LESSON meant to be read in under 5 minutes — think bite-sized daily lesson, not a textbook chapter. Output ONLY valid JSON (no markdown fences) with this shape:
 {"content_html": "string of simple HTML using <p>,<h3>,<ul>,<li>,<strong>,<em> only", "quiz": [{"question":"string","options":["a","b","c","d"],"correctIndex":0,"explanation":"string"}]}
 The content_html should include sections (use <h3> headers), in this order:
@@ -537,13 +549,13 @@ The content_html should include sections (use <h3> headers), in this order:
 3. An Analogy — to make it stick.
 4. Perspectives — IMPORTANT: if this topic has more than one scholarly, cultural, or traditional viewpoint (this is especially true for religion, history, philosophy, or any topic where interpretations differ), briefly name 2-3 distinct perspectives side by side and be explicit about which points are broadly agreed upon versus actively debated or interpreted differently across traditions/scholars. Never present one tradition's view as the neutral default. If the topic is genuinely a single-consensus factual matter (e.g. basic arithmetic), this section can instead briefly note that it's well-established and skip straight to Practice.
 5. Practice/Summary — a short recap.
-Keep each section to 2-4 short sentences — total reading time under 5 minutes even with the Perspectives section included. Write for a "${topic.level}" learner who prefers a "${topic.style}" style.${countryLine}${memoryLine} Include 2-3 quiz questions at the end (in the quiz array, not in content_html) — at least one should test understanding of a perspective/nuance, not just a fact. Do not use markdown asterisks for bold/italic — use the actual HTML tags instead.`;
+Keep each section to 2-4 short sentences — total reading time under 5 minutes even with the Perspectives section included. Write for a "${topic.level}" learner who prefers a "${topic.style}" style.${countryLine}${memoryLine} Include 2-3 quiz questions at the end (in the quiz array, not in content_html) — at least one should test understanding of a perspective/nuance, not just a fact. Do not use markdown asterisks for bold/italic — use the actual HTML tags instead.${groundingLine}`;
   const user = `Topic: ${topic.title}\nLesson: "${lesson.title}"\nLessons already covered: ${priorTitles}`;
 
   const result = await callAI([
     { role: "system", content: sys },
     { role: "user", content: user }
-  ], { json: true });
+  ], { json: true, maxTokens: 1000 });
 
   lesson.content = result.content_html;
   lesson.quiz = (result.quiz || []).map(q => ({
@@ -552,8 +564,9 @@ Keep each section to 2-4 short sentences — total reading time under 5 minutes 
     options: q.options.map(cleanText),
     explanation: cleanText(q.explanation)
   }));
-  lesson.imageUrl = await fetchLessonImage(topic.title + " " + lesson.title); // free, keyless, no AI cost
-  lesson.furtherReading = await fetchFurtherReading(topic.title + " " + lesson.title); // real Wikipedia links, no AI cost
+  // These were already running in the background during the AI call above — just collect them now.
+  lesson.imageUrl = await imagePromise;
+  lesson.furtherReading = await readingPromise;
   await saveTopics();
 }
 
@@ -696,7 +709,7 @@ async function sendChat(topicId, idx, text, quickAction) {
     const reply = await callAI([
       { role: "system", content: sys },
       ...history
-    ]);
+    ], { maxTokens: 400 });
     log.push({ role: "ai", text: cleanText(reply) });
   } catch (e) {
     state.error = friendlyError(e);
@@ -738,6 +751,26 @@ async function fetchFurtherReading(query, limit = 3) {
       .filter(p => p.url);
   } catch (e) {
     return []; // never block the lesson on this
+  }
+}
+
+// Free, keyless way to ground lesson generation in real, current text instead of
+// relying purely on the model's training memory. Not live search, but far fresher
+// and fact-checkable than nothing — Wikipedia is edited constantly.
+async function fetchWikiExtract(query, maxChars = 900) {
+  try {
+    const url = "https://en.wikipedia.org/w/api.php?action=query&format=json&generator=search&gsrsearch=" +
+      encodeURIComponent(query) + "&gsrlimit=1&prop=extracts&exintro=1&explaintext=1&origin=*";
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const pages = data?.query?.pages;
+    if (!pages) return null;
+    const extract = Object.values(pages)[0]?.extract;
+    if (!extract) return null;
+    return extract.slice(0, maxChars);
+  } catch (e) {
+    return null; // grounding is a nice-to-have, lesson still generates from model knowledge without it
   }
 }
 
