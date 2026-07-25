@@ -111,6 +111,17 @@
     box-shadow: 2px 3px 0 rgba(34,49,66,0.06);
   }
   .new-topic-box h2 { margin-top: 0; font-size: 20px; font-family: var(--display); font-weight: 600; }
+  .autocomplete-box {
+    position: absolute; top: calc(100% + 2px); left: 0; right: 0; z-index: 20;
+    background: var(--card); border: 1px solid var(--line); border-radius: 2px;
+    box-shadow: 2px 3px 0 rgba(34,49,66,0.1); max-height: 220px; overflow-y: auto;
+  }
+  .autocomplete-item {
+    padding: 10px 14px; font-family: var(--body-serif); font-size: 15px; cursor: pointer;
+    border-bottom: 1px solid var(--line);
+  }
+  .autocomplete-item:last-child { border-bottom: none; }
+  .autocomplete-item:hover { background: var(--paper); }
   .further-reading {
     margin-top: 24px; padding-top: 16px; border-top: 1px dashed var(--line);
     display: flex; flex-direction: column; gap: 6px;
@@ -271,7 +282,7 @@ async function getFreeModelList() {
       .map(m => m.id);
     const fastFirst = bySpeedHint(free).slice(0, 6);
     // Auto-router first (self-selects a live free model), then fastest-looking real ones as backup
-    liveFreeModels = ["openrouter/free", ...fastFirst];
+    liveFreeModels = [...fastFirst, "openrouter/free"];
     if (liveFreeModels.length <= 1) liveFreeModels = FALLBACK_MODEL_CANDIDATES;
   } catch (e) {
     liveFreeModels = FALLBACK_MODEL_CANDIDATES;
@@ -531,7 +542,7 @@ async function generateLessonContent(topic, lesson, idx) {
   const memoryLine = profileSummary(topic);
   const searchQuery = topic.title + " " + lesson.title;
 
-  // Kick off everything independent of the AI text call in parallel, instead of waiting on each in sequence.
+  // Kick off everything independent of the AI text in parallel, instead of waiting on each in sequence.
   const imagePromise = fetchLessonImage(searchQuery);
   const readingPromise = fetchFurtherReading(searchQuery);
   const groundingPromise = fetchWikiExtract(searchQuery); // real current text, used to ground the lesson in facts
@@ -549,13 +560,13 @@ The content_html should include sections (use <h3> headers), in this order:
 3. An Analogy — to make it stick.
 4. Perspectives — IMPORTANT: if this topic has more than one scholarly, cultural, or traditional viewpoint (this is especially true for religion, history, philosophy, or any topic where interpretations differ), briefly name 2-3 distinct perspectives side by side and be explicit about which points are broadly agreed upon versus actively debated or interpreted differently across traditions/scholars. Never present one tradition's view as the neutral default. If the topic is genuinely a single-consensus factual matter (e.g. basic arithmetic), this section can instead briefly note that it's well-established and skip straight to Practice.
 5. Practice/Summary — a short recap.
-Keep each section to 2-4 short sentences — total reading time under 5 minutes even with the Perspectives section included. Write for a "${topic.level}" learner who prefers a "${topic.style}" style.${countryLine}${memoryLine} Include 2-3 quiz questions at the end (in the quiz array, not in content_html) — at least one should test understanding of a perspective/nuance, not just a fact. Do not use markdown asterisks for bold/italic — use the actual HTML tags instead.${groundingLine}`;
+Keep each section to 2-4 short sentences — total reading time under 5 minutes even with the Perspectives section included. Write for a "${topic.level}" learner who prefers a "${topic.style}" style.${countryLine}${memoryLine} Include exactly 2 quiz questions (in the quiz array, not in content_html) — at least one should test understanding of a perspective/nuance, not just a fact. Keep quiz explanations to one short sentence. Do not use markdown asterisks for bold/italic — use the actual HTML tags instead.${groundingLine}`;
   const user = `Topic: ${topic.title}\nLesson: "${lesson.title}"\nLessons already covered: ${priorTitles}`;
 
   const result = await callAI([
     { role: "system", content: sys },
     { role: "user", content: user }
-  ], { json: true, maxTokens: 1000 });
+  ], { json: true, maxTokens: 900 });
 
   lesson.content = result.content_html;
   lesson.quiz = (result.quiz || []).map(q => ({
@@ -564,7 +575,7 @@ Keep each section to 2-4 short sentences — total reading time under 5 minutes 
     options: q.options.map(cleanText),
     explanation: cleanText(q.explanation)
   }));
-  // These were already running in the background during the AI call above — just collect them now.
+  // These were already running in the background during the AI calls above — just collect them now.
   lesson.imageUrl = await imagePromise;
   lesson.furtherReading = await readingPromise;
   await saveTopics();
@@ -757,6 +768,20 @@ async function fetchFurtherReading(query, limit = 3) {
 // Free, keyless way to ground lesson generation in real, current text instead of
 // relying purely on the model's training memory. Not live search, but far fresher
 // and fact-checkable than nothing — Wikipedia is edited constantly.
+// Live topic suggestions as you type — free, keyless, real (Wikipedia's own search-as-you-type API).
+async function fetchTopicSuggestions(query, limit = 6) {
+  try {
+    const url = "https://en.wikipedia.org/w/api.php?action=opensearch&format=json&limit=" + limit +
+      "&search=" + encodeURIComponent(query) + "&origin=*";
+    const res = await fetch(url);
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data[1] || []; // opensearch returns [query, [titles], [descriptions], [urls]]
+  } catch (e) {
+    return [];
+  }
+}
+
 async function fetchWikiExtract(query, maxChars = 900) {
   try {
     const url = "https://en.wikipedia.org/w/api.php?action=query&format=json&generator=search&gsrsearch=" +
@@ -959,10 +984,35 @@ function NewTopicView() {
 
   if (step === 1) {
     box.appendChild(el("h2", {}, "What do you want to learn?"));
-    const input = el("input", { type: "text", placeholder: "e.g. Comparative religion, Roman history, guitar..." });
+    const inputWrap = el("div", { style: "position:relative;" });
+    const input = el("input", { type: "text", placeholder: "e.g. Comparative religion, Roman history, guitar...", autocomplete: "off" });
     input.value = state.newTopicDraft.title;
-    input.addEventListener("input", e => { state.newTopicDraft.title = e.target.value; });
-    box.appendChild(input);
+    const suggestBox = el("div", { class: "autocomplete-box" });
+    inputWrap.appendChild(input);
+    inputWrap.appendChild(suggestBox);
+
+    let debounceTimer;
+    input.addEventListener("input", e => {
+      state.newTopicDraft.title = e.target.value;
+      clearTimeout(debounceTimer);
+      const q = e.target.value.trim();
+      if (q.length < 2) { suggestBox.innerHTML = ""; return; }
+      debounceTimer = setTimeout(async () => {
+        const suggestions = await fetchTopicSuggestions(q);
+        suggestBox.innerHTML = "";
+        suggestions.forEach(s => {
+          const item = el("div", { class: "autocomplete-item" }, s);
+          item.addEventListener("mousedown", () => { // mousedown fires before input blur
+            state.newTopicDraft.title = s;
+            input.value = s;
+            suggestBox.innerHTML = "";
+          });
+          suggestBox.appendChild(item);
+        });
+      }, 300); // debounce so we're not firing a request on every keystroke
+    });
+    input.addEventListener("blur", () => setTimeout(() => { suggestBox.innerHTML = ""; }, 150));
+    box.appendChild(inputWrap);
     const row = el("div", { class: "row" });
     const next = el("button", { class: "btn-primary" }, "Next");
     next.addEventListener("click", () => {
