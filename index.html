@@ -320,6 +320,65 @@ let state = {
 
 function render() { App(); }
 
+// ============================== DEPENDENCY GRAPH HELPERS ==============================
+// Lessons carry an id + prerequisites (array of lesson ids) instead of relying purely on
+// array order. This lets the curriculum branch/merge slightly instead of being a strict
+// straight line, while staying fully backward compatible with topics saved before this
+// existed (those just get treated as a simple chain, id-per-index).
+
+// Backfills id/prerequisites on any topic saved before the dependency graph existed,
+// so every topic can be treated uniformly from here on. Safe to call repeatedly.
+function ensureGraphFields(topic) {
+  if (!topic || !topic.lessons) return;
+  topic.lessons.forEach((l, i) => { if (!l.id) l.id = "l" + i; });
+  topic.lessons.forEach((l, i) => {
+    if (!Array.isArray(l.prerequisites)) l.prerequisites = i === 0 ? [] : [topic.lessons[i - 1].id];
+  });
+}
+function ensureGraphFieldsAll() { Object.values(state.topics).forEach(ensureGraphFields); }
+
+// Defends against AI-generated graphs that reference missing ids, self-reference, or
+// form a cycle — any of which would otherwise soft-lock the whole curriculum with no
+// lesson ever becoming available. Falls back those specific lessons to a simple chain.
+function sanitizeGraph(lessons) {
+  const ids = new Set(lessons.map(l => l.id));
+  lessons.forEach(l => { l.prerequisites = (l.prerequisites || []).filter(pid => ids.has(pid) && pid !== l.id); });
+  if (!lessons.some(l => l.prerequisites.length === 0) && lessons.length) lessons[0].prerequisites = [];
+
+  // BFS reachability from every zero-prerequisite lesson; anything unreachable
+  // (dangling/cyclical references) gets chained to the previous lesson instead.
+  const reachable = new Set(lessons.filter(l => l.prerequisites.length === 0).map(l => l.id));
+  let changed = true;
+  while (changed) {
+    changed = false;
+    lessons.forEach(l => {
+      if (!reachable.has(l.id) && l.prerequisites.every(pid => reachable.has(pid))) { reachable.add(l.id); changed = true; }
+    });
+  }
+  lessons.forEach((l, i) => { if (!reachable.has(l.id)) l.prerequisites = i > 0 ? [lessons[i - 1].id] : []; });
+}
+
+function isLessonUnlocked(topic, lesson) {
+  if (lesson.isReview || lesson.isDailyReview) return true; // side-quest lessons are always open, not part of the main path
+  return (lesson.prerequisites || []).every(pid => {
+    const p = topic.lessons.find(l => l.id === pid);
+    return p && p.done;
+  });
+}
+
+// Picks the next recommended lesson: first not-done, unlocked lesson in curriculum order.
+// `assumeDoneId`, if given, treats that one lesson as done for this calculation — used by
+// prefetch to ask "what comes right after the one they're currently reading" even before
+// they've actually finished/quizzed on it yet. Review/daily-review side-quest lessons are
+// never suggested as "the next lesson" — they're only reached via their own buttons.
+function chooseNextLesson(topic, assumeDoneId) {
+  const doneIds = new Set(topic.lessons.filter(l => l.done || l.id === assumeDoneId).map(l => l.id));
+  return topic.lessons.find(l =>
+    !l.done && l.id !== assumeDoneId && !l.isReview && !l.isDailyReview &&
+    (l.prerequisites || []).every(pid => doneIds.has(pid))
+  ) || null;
+}
+
 async function loadTopics() {
   try {
     // --- Handle OAuth Redirect Hash Fragment ---
@@ -337,6 +396,7 @@ async function loadTopics() {
 
     const raw = localStorage.getItem("learn-anything-topics");
     if (raw) state.topics = JSON.parse(raw); // local cache loads instantly, before any network call
+    ensureGraphFieldsAll(); // backfill id/prerequisites on any topic saved before the dependency graph existed
     const streakRaw = localStorage.getItem("learn-anything-streak");
     if (streakRaw) {
       const s = JSON.parse(streakRaw);
@@ -436,6 +496,7 @@ async function pullFromServer() {
         }
       }
       state.topics = merged;
+      ensureGraphFieldsAll(); // backfill for any topic (local or server) saved before the dependency graph existed
       localStorage.setItem("learn-anything-topics", JSON.stringify(state.topics));
       state.syncStatus = "synced";
       render();
@@ -517,6 +578,7 @@ function importBackup(file) {
       const parsed = JSON.parse(e.target.result);
       if (!parsed.topics) throw new Error("Not a valid backup file");
       state.topics = { ...state.topics, ...parsed.topics }; // merge, don't wipe current progress
+      ensureGraphFieldsAll(); // backfill for backups exported before the dependency graph existed
       saveTopics();
       render();
     } catch (err) {
@@ -584,8 +646,8 @@ async function generateCurriculum() {
   render();
 
   const sys = `You are a curriculum designer. Given a topic, learner level, and learning style, output ONLY valid JSON (no markdown fences, no commentary) with this exact shape:
-{"lessons": [{"title": "string"}]}
-Produce 6 to 9 lessons that form a logical learning sequence from foundational to more advanced, appropriate for the stated level. Keep titles short and concrete. If the topic spans multiple traditions, schools of thought, or cultures (this is common for religion, philosophy, history, or comparative subjects), make sure at least one or two lessons explicitly compare perspectives across them rather than only teaching a single tradition's account as if it were the whole subject.`;
+{"lessons": [{"id": "l1", "title": "string", "prerequisites": []}, {"id": "l2", "title": "string", "prerequisites": ["l1"]}]}
+Produce 6 to 9 lessons that form a logical learning sequence from foundational to more advanced, appropriate for the stated level. Use short sequential ids like "l1","l2",... "prerequisites" lists the ids of lessons that should be understood before this one — most lessons should just depend on the single lesson before them (a simple chain), but where it makes real sense (e.g. two independent foundational lessons both feed into one later lesson, or a lesson has no real prerequisite and could be taken early), reflect that with 0, 1, or 2 prerequisite ids. Keep it mostly linear — at most 2-3 branch points total, since this should still feel like a simple guided path, not a complex diagram. Keep titles short and concrete. If the topic spans multiple traditions, schools of thought, or cultures (this is common for religion, philosophy, history, or comparative subjects), make sure at least one or two lessons explicitly compare perspectives across them rather than only teaching a single tradition's account as if it were the whole subject.`;
   const countryLine = draft.country ? `\nLearner's country: ${draft.country} (prefer this context where relevant for later lesson examples, not necessarily in titles)` : "";
   const user = `Topic: ${draft.title}\nLearner level: ${draft.level}\nPreferred learning style: ${draft.style}${countryLine}`;
 
@@ -593,9 +655,17 @@ Produce 6 to 9 lessons that form a logical learning sequence from foundational t
     const result = await callAI([
       { role: "system", content: sys },
       { role: "user", content: user }
-    ], { json: true, maxTokens: 500 });
+    ], { json: true, maxTokens: 550 });
 
     const id = "t_" + Date.now();
+    const lessons = (result.lessons || []).map((l, i) => ({
+      id: l.id || ("l" + i),
+      title: l.title,
+      prerequisites: Array.isArray(l.prerequisites) ? l.prerequisites : [],
+      content: null, quiz: null, done: false
+    }));
+    sanitizeGraph(lessons); // guards against bad/cyclical AI output soft-locking the curriculum
+
     state.topics[id] = {
       id,
       title: draft.title.trim(),
@@ -603,13 +673,13 @@ Produce 6 to 9 lessons that form a logical learning sequence from foundational t
       style: draft.style,
       country: draft.country || "",
       createdAt: Date.now(),
-      lessons: result.lessons.map(l => ({ title: l.title, content: null, done: false }))
+      lessons
     };
     await saveTopics();
     state.activeTopicId = id;
     state.view = "curriculum";
     track("topic_created", { topic: draft.title.trim(), level: draft.level, style: draft.style });
-    prefetchNextLesson({ ...state.topics[id], id }, -1); // starts lesson 1 generating silently while they view the curriculum list
+    prefetchNextLesson({ ...state.topics[id], id }, null); // starts the first available lesson generating silently while they view the curriculum list
     state.newTopicDraft = { title: "", level: "Beginner", style: "examples", country: draft.country, step: 1 };
   } catch (e) {
     state.error = friendlyError(e);
@@ -626,7 +696,7 @@ async function openReviewLesson(topicId) {
   // Create (or reuse) a special review lesson slot at the end of the lessons array
   let reviewIdx = topic.lessons.findIndex(l => l.isReview);
   if (reviewIdx === -1) {
-    topic.lessons.push({ title: "Review: your weak spots", isReview: true, content: null, done: false });
+    topic.lessons.push({ id: "review_" + topic.id, title: "Review: your weak spots", isReview: true, prerequisites: [], content: null, done: false });
     reviewIdx = topic.lessons.length - 1;
   } else {
     topic.lessons[reviewIdx].content = null; // regenerate fresh each time, since weak spots change
@@ -673,7 +743,7 @@ async function openDailyReview(topicId) {
 
   let reviewIdx = topic.lessons.findIndex(l => l.isDailyReview);
   if (reviewIdx === -1) {
-    topic.lessons.push({ title: "Daily Review", isDailyReview: true, content: null, done: false });
+    topic.lessons.push({ id: "dailyreview_" + topic.id, title: "Daily Review", isDailyReview: true, prerequisites: [], content: null, done: false });
     reviewIdx = topic.lessons.length - 1;
   } else {
     topic.lessons[reviewIdx].content = null;
@@ -714,7 +784,10 @@ content_html should be a short 2-3 sentence friendly intro only ("Let's make sur
 }
 
 async function generateLessonContent(topic, lesson, idx) {
-  const priorTitles = topic.lessons.slice(0, idx).map(l => l.title).join(", ") || "none";
+  // Prefer lessons actually marked done (accurate even with branching); fall back to
+  // simple array-order for the rare case a topic has no completed lessons yet.
+  const doneTitles = topic.lessons.filter(l => l.done).map(l => l.title);
+  const priorTitles = (doneTitles.length ? doneTitles : topic.lessons.slice(0, idx).map(l => l.title)).join(", ") || "none";
   const countryLine = topic.country ? ` Use examples, references, units, currency, and illustrations relevant to ${topic.country} wherever it naturally fits the topic.` : "";
   const memoryLine = profileSummary(topic);
   const searchQuery = topic.title + " " + lesson.title;
@@ -764,11 +837,14 @@ let prefetchStatus = {}; // "topicId:idx" -> "loading" | "done", purely for the 
 // Silently generates the next lesson in the background while the learner is still
 // reading the current one. Never touches loading/error state — if it fails, the
 // lesson simply generates normally (visibly) whenever they actually open it.
-function prefetchNextLesson(topic, idx) {
-  const nextIdx = idx + 1;
-  const next = topic.lessons[nextIdx];
-  const key = topic.id + ":" + nextIdx;
-  if (!next || next.content || prefetchInFlight.has(key)) return;
+// currentLessonId: the lesson just opened/finished generating, or null when there's no
+// "current" lesson yet (e.g. right after curriculum creation, before any lesson opened).
+function prefetchNextLesson(topic, currentLessonId) {
+  const next = chooseNextLesson(topic, currentLessonId);
+  if (!next || next.content) return;
+  const key = topic.id + ":" + next.id;
+  if (prefetchInFlight.has(key)) return;
+  const nextIdx = topic.lessons.indexOf(next);
   prefetchInFlight.add(key);
   prefetchStatus[key] = "loading";
   render();
@@ -791,7 +867,7 @@ async function openLesson(topicId, idx) {
 
   const lesson = topic.lessons[idx];
   if (lesson.content) {
-    prefetchNextLesson(topic, idx); // already cached — get a head start on the one after
+    prefetchNextLesson(topic, lesson.id); // already cached — get a head start on the one after
     return;
   }
 
@@ -801,7 +877,7 @@ async function openLesson(topicId, idx) {
 
   try {
     await generateLessonContent(topic, lesson, idx);
-    prefetchNextLesson(topic, idx); // now that this one's done, quietly start the next
+    prefetchNextLesson(topic, lesson.id); // now that this one's done, quietly start the next
   } catch (e) {
     state.error = friendlyError(e);
   }
@@ -1396,10 +1472,31 @@ function CurriculumView() {
 
   const list = el("div", { class: "lesson-list" });
   topic.lessons.forEach((lesson, idx) => {
-    const row = el("div", { class: "lesson-row" + (lesson.done ? " done" : ""), onclick: () => openLesson(topic.id, idx) }, [
-      el("div", { class: "lesson-num" }, lesson.done ? "✓" : String(idx+1)),
-      el("div", {}, lesson.title)
-    ]);
+    const unlocked = isLessonUnlocked(topic, lesson);
+    const classes = "lesson-row" + (lesson.done ? " done" : "") + (!unlocked && !lesson.done ? " locked" : "");
+    let row;
+    if (unlocked || lesson.done) {
+      row = el("div", { class: classes, onclick: () => openLesson(topic.id, idx) }, [
+        el("div", { class: "lesson-num" }, lesson.done ? "✓" : String(idx+1)),
+        el("div", {}, lesson.title)
+      ]);
+    } else {
+      const prereqTitles = (lesson.prerequisites || [])
+        .map(pid => topic.lessons.find(l => l.id === pid))
+        .filter(p => p && !p.done)
+        .map(p => p.title);
+      const rowContent = el("div", { style: "flex:1;" }, [
+        el("div", {}, lesson.title),
+        prereqTitles.length ? el("div", { style: "font-family:-apple-system,sans-serif;font-size:11px;color:#8a8578;margin-top:2px;" }, "Unlocks after: " + prereqTitles.join(", ")) : null
+      ]);
+      const openAnywayBtn = el("button", { class: "btn-ghost", style: "font-size:11px;padding:5px 9px;flex-shrink:0;" }, "Open anyway");
+      openAnywayBtn.addEventListener("click", (e) => { e.stopPropagation(); openLesson(topic.id, idx); }); // locked is a recommendation, not a hard block — learner stays in control
+      row = el("div", { class: classes, style: "cursor:default;" }, [
+        el("div", { class: "lesson-num" }, "🔒"),
+        rowContent,
+        openAnywayBtn
+      ]);
+    }
     list.appendChild(row);
   });
   wrap.appendChild(list);
@@ -1427,9 +1524,9 @@ function LessonView() {
   view.appendChild(el("h2", {}, lesson.title));
 
   if (lesson.content) {
-    const nextKey = topic.id + ":" + (idx + 1);
-    const hasNext = idx + 1 < topic.lessons.length;
-    if (hasNext && prefetchStatus[nextKey]) {
+    const upcoming = chooseNextLesson(topic, lesson.id);
+    const nextKey = upcoming ? topic.id + ":" + upcoming.id : null;
+    if (nextKey && prefetchStatus[nextKey]) {
       const s = prefetchStatus[nextKey];
       view.appendChild(el("div", {
         style: "font-family:-apple-system,sans-serif;font-size:12px;color:#8a8578;margin-bottom:12px;display:flex;align-items:center;gap:6px;"
