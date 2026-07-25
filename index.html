@@ -322,6 +322,19 @@ function render() { App(); }
 
 async function loadTopics() {
   try {
+    // --- Handle OAuth Redirect Hash Fragment ---
+    const hash = window.location.hash;
+    if (hash.includes('token=')) {
+      const params = new URLSearchParams(hash.substring(1));
+      const token = params.get('token');
+      const email = params.get('email');
+      if (token) {
+        state.session = { email: email ? decodeURIComponent(email) : "Google User", token: token };
+        localStorage.setItem("learn-anything-session", JSON.stringify(state.session));
+        history.replaceState(null, null, window.location.pathname);
+      }
+    }
+
     const raw = localStorage.getItem("learn-anything-topics");
     if (raw) state.topics = JSON.parse(raw); // local cache loads instantly, before any network call
     const streakRaw = localStorage.getItem("learn-anything-streak");
@@ -331,14 +344,13 @@ async function loadTopics() {
       state.lastActiveDate = s.lastDate || null;
     }
     const sessionRaw = localStorage.getItem("learn-anything-session");
-    if (sessionRaw) state.session = JSON.parse(sessionRaw);
+    if (sessionRaw && !state.session) state.session = JSON.parse(sessionRaw);
   } catch (e) { /* no data yet, or storage unavailable (e.g. private browsing) */ }
   updateStreak();
   render();
 
   if (state.session) await pullFromServer(); // merge in anything saved from another device
 }
-
 function updateStreak() {
   const today = new Date().toDateString();
   if (state.lastActiveDate === today) return; // already counted today
@@ -1089,7 +1101,7 @@ function AccountView() {
       href: WORKER_URL + "/auth/login", 
       class: "btn-primary", 
       style: "display:block;text-align:center;text-decoration:none;margin-bottom:16px;background:var(--moss);" 
-    }, "Sign in with OAuth");
+    }, "Sign in with Google");
     box.appendChild(oauthBtn);
 
     box.appendChild(el("div", { style: "text-align:center;font-family:-apple-system,sans-serif;font-size:12px;color:#8a8578;margin-bottom:12px;" }, "— or use email —"));
