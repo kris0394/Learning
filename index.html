@@ -387,8 +387,9 @@ async function loadTopics() {
       const params = new URLSearchParams(hash.substring(1));
       const token = params.get('token');
       const email = params.get('email');
+      const verified = params.get('verified');
       if (token) {
-        state.session = { email: email ? decodeURIComponent(email) : "Google User", token: token };
+        state.session = { email: email ? decodeURIComponent(email) : "Google User", token: token, emailVerified: verified === "1" };
         localStorage.setItem("learn-anything-session", JSON.stringify(state.session));
         history.replaceState(null, null, window.location.pathname);
       }
@@ -514,7 +515,7 @@ async function signup(email, password) {
   });
   const data = await res.json();
   if (!data.ok) throw new Error(data.error || "Signup failed");
-  state.session = { email: data.email, token: data.token };
+  state.session = { email: data.email, token: data.token, emailVerified: !!data.emailVerified };
   localStorage.setItem("learn-anything-session", JSON.stringify(state.session));
   return data;
 }
@@ -527,7 +528,7 @@ async function login(email, password) {
   });
   const data = await res.json();
   if (!data.ok) throw new Error(data.error || "Login failed");
-  state.session = { email: data.email, token: data.token };
+  state.session = { email: data.email, token: data.token, emailVerified: !!data.emailVerified };
   localStorage.setItem("learn-anything-session", JSON.stringify(state.session));
   return data;
 }
@@ -541,6 +542,36 @@ async function requestPasswordReset(email) {
   const data = await res.json();
   if (!data.ok) throw new Error(data.error || "Couldn't send reset email");
   return data;
+}
+
+async function resendVerification() {
+  if (!state.session) return;
+  const res = await fetchWithRetry(WORKER_URL + "/resend-verification", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: state.session.email })
+  });
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error || "Couldn't resend — try again");
+  return data;
+}
+
+// Re-checks verification status from the server — used after someone clicks the
+// verification link in another tab and comes back without wanting to log out/in again.
+async function refreshVerificationStatus() {
+  if (!state.session) return;
+  try {
+    const res = await fetchWithRetry(WORKER_URL + "/me", {
+      method: "GET",
+      headers: { "Authorization": "Bearer " + state.session.token }
+    });
+    const data = await res.json();
+    if (data.ok) {
+      state.session.emailVerified = !!data.emailVerified;
+      localStorage.setItem("learn-anything-session", JSON.stringify(state.session));
+    }
+  } catch (e) { /* silent — banner just stays until next successful check */ }
+  render();
 }
 
 function logout() {
@@ -613,6 +644,14 @@ async function callAI(messages, { json = false, maxTokens = 900 } = {}) {
         body: JSON.stringify({ model, messages, temperature: 0.7, max_tokens: maxTokens })
       });
       if (res.status === 401) { logout(); throw new Error("Session expired — please sign in again"); }
+      if (res.status === 403) {
+        const errData = await res.json().catch(() => ({}));
+        if (errData.code === "EMAIL_NOT_VERIFIED") {
+          if (state.session) state.session.emailVerified = false; // reflect it locally so the banner shows without waiting on next login
+          throw new Error("EMAIL_NOT_VERIFIED: " + (errData.error || "Please verify your email first"));
+        }
+        throw new Error(errData.error || "Not allowed");
+      }
       if (res.status === 429) { throw new Error("Daily AI usage limit reached — resets tomorrow"); }
       if (!res.ok) {
         const t = await res.text().catch(()=> "");
@@ -628,7 +667,7 @@ async function callAI(messages, { json = false, maxTokens = 900 } = {}) {
       return content;
     } catch (e) {
       lastErr = e;
-      if (e.message.includes("usage limit") || e.message.includes("Sign in required")) break; // no point trying other models
+      if (e.message.includes("usage limit") || e.message.includes("Sign in required") || e.message.includes("EMAIL_NOT_VERIFIED")) break; // no point trying other models
       // otherwise try next candidate model
     }
   }
@@ -1061,6 +1100,9 @@ function stripHtml(html) {
 function friendlyError(e) {
   const msg = (e && e.message) || "";
   const low = msg.toLowerCase();
+  if (low.includes("email_not_verified")) {
+    return "Please verify your email before generating lessons — check your inbox (and spam folder) for the link, or resend it from the account screen.";
+  }
   if (low.includes("429") || low.includes("rate")) {
     return "Hit the free-tier rate limit on OpenRouter. Wait a bit and try again — nothing was lost, your progress is saved.";
   }
@@ -1128,6 +1170,29 @@ function App() {
 
   if (state.error) {
     root.appendChild(el("div", { class: "error-box" }, state.error));
+  }
+
+  if (state.session && state.session.emailVerified === false && state.view !== "account") {
+    const banner = el("div", { class: "error-box", style: "background:#fff8e6;border-color:var(--clay);color:#6b4e17;display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;" }, [
+      el("span", {}, "📩 Verify your email to generate new lessons — check your inbox."),
+      el("div", { style: "display:flex;gap:6px;flex-shrink:0;" }, [
+        el("button", { class: "btn-ghost", style: "font-size:11px;padding:5px 10px;" }, "I've verified"),
+        el("button", { class: "btn-ghost", style: "font-size:11px;padding:5px 10px;" }, "Resend")
+      ])
+    ]);
+    const [refreshBtn, resendBtn] = banner.lastChild.children;
+    refreshBtn.addEventListener("click", async () => {
+      refreshBtn.textContent = "Checking...";
+      await refreshVerificationStatus();
+      if (state.session && state.session.emailVerified) return; // render() inside refresh already updates the view, banner will be gone
+      refreshBtn.textContent = "I've verified";
+    });
+    resendBtn.addEventListener("click", async () => {
+      resendBtn.textContent = "Sending...";
+      try { await resendVerification(); resendBtn.textContent = "Sent!"; }
+      catch (e) { resendBtn.textContent = "Resend"; state.error = e.message; render(); }
+    });
+    root.appendChild(banner);
   }
 
   if (state.loading) {
