@@ -362,21 +362,42 @@ function isLessonUnlocked(topic, lesson) {
   if (lesson.isReview || lesson.isDailyReview) return true; // side-quest lessons are always open, not part of the main path
   return (lesson.prerequisites || []).every(pid => {
     const p = topic.lessons.find(l => l.id === pid);
-    return p && p.done;
+    return p && (p.done || p.skipped); // a skipped lesson still counts as "resolved" for unlocking purposes
   });
 }
 
-// Picks the next recommended lesson: first not-done, unlocked lesson in curriculum order.
-// `assumeDoneId`, if given, treats that one lesson as done for this calculation — used by
-// prefetch to ask "what comes right after the one they're currently reading" even before
-// they've actually finished/quizzed on it yet. Review/daily-review side-quest lessons are
-// never suggested as "the next lesson" — they're only reached via their own buttons.
+// Picks the next recommended lesson: first not-done, not-skipped, unlocked lesson in
+// curriculum order. `assumeDoneId`, if given, treats that one lesson as resolved for this
+// calculation — used by prefetch to ask "what comes right after the one they're currently
+// reading" even before they've actually finished/quizzed on it yet. Review/daily-review
+// side-quest lessons are never suggested as "the next lesson" — only reached via their own buttons.
 function chooseNextLesson(topic, assumeDoneId) {
-  const doneIds = new Set(topic.lessons.filter(l => l.done || l.id === assumeDoneId).map(l => l.id));
+  const resolvedIds = new Set(topic.lessons.filter(l => l.done || l.skipped || l.id === assumeDoneId).map(l => l.id));
   return topic.lessons.find(l =>
-    !l.done && l.id !== assumeDoneId && !l.isReview && !l.isDailyReview &&
-    (l.prerequisites || []).every(pid => doneIds.has(pid))
+    !l.done && !l.skipped && l.id !== assumeDoneId && !l.isReview && !l.isDailyReview &&
+    (l.prerequisites || []).every(pid => resolvedIds.has(pid))
   ) || null;
+}
+
+// Notices when a learner is consistently doing well and proactively offers to skip the
+// currently-recommended lesson in favor of jumping straight to whatever comes after it —
+// rather than only passively allowing an "Open anyway" override on locked lessons.
+// Deliberately conservative: requires real signal (several correct answers, zero open
+// weak spots) and at least one lesson already completed, so it never fires on lesson one.
+function findSkipAheadSuggestion(topic) {
+  const profile = topic.profile;
+  if (!profile || (profile.strong || []).length < 3) return null;
+  if ((profile.weak || []).length > 0) return null; // open weak spots mean reinforcement is more useful than skipping
+  if (topic.lessons.filter(l => l.done).length < 2) return null;
+
+  const next = chooseNextLesson(topic, null);
+  if (!next) return null;
+  const afterNext = chooseNextLesson(topic, next.id); // what would unlock if `next` were resolved
+  if (!afterNext) return null; // nothing further to jump ahead to
+
+  const suggestionKey = next.id + ":" + afterNext.id;
+  if (topic.dismissedSkipFor === suggestionKey) return null; // already turned down this exact suggestion
+  return { skip: next, jumpTo: afterNext, key: suggestionKey };
 }
 
 async function loadTopics() {
@@ -908,10 +929,11 @@ async function openLesson(topicId, idx) {
   const topic = state.topics[topicId];
   topic.lastOpenedIndex = idx;
   topic.lastOpenedAt = Date.now();
+  const lesson = topic.lessons[idx];
+  if (lesson.skipped) lesson.skipped = false; // opening it is un-skipping it — they're engaging with it now
   saveTopics();
   render();
 
-  const lesson = topic.lessons[idx];
   if (lesson.content) {
     prefetchNextLesson(topic, lesson.id); // already cached — get a head start on the one after
     return;
@@ -1600,7 +1622,15 @@ function CurriculumView() {
     const unlocked = isLessonUnlocked(topic, lesson);
     const classes = "lesson-row" + (lesson.done ? " done" : "") + (!unlocked && !lesson.done ? " locked" : "");
     let row;
-    if (unlocked || lesson.done) {
+    if (lesson.skipped && !lesson.done) {
+      row = el("div", { class: classes, onclick: () => openLesson(topic.id, idx) }, [
+        el("div", { class: "lesson-num", style: "opacity:0.6;" }, "⤼"),
+        el("div", {}, [
+          el("div", { style: "opacity:0.7;" }, lesson.title),
+          el("div", { style: "font-family:-apple-system,sans-serif;font-size:11px;color:#8a8578;margin-top:2px;" }, "Skipped — tap to come back to it anytime")
+        ])
+      ]);
+    } else if (unlocked || lesson.done) {
       row = el("div", { class: classes, onclick: () => openLesson(topic.id, idx) }, [
         el("div", { class: "lesson-num" }, lesson.done ? "✓" : String(idx+1)),
         el("div", {}, lesson.title)
@@ -1608,7 +1638,7 @@ function CurriculumView() {
     } else {
       const prereqTitles = (lesson.prerequisites || [])
         .map(pid => topic.lessons.find(l => l.id === pid))
-        .filter(p => p && !p.done)
+        .filter(p => p && !p.done && !p.skipped)
         .map(p => p.title);
       const rowContent = el("div", { style: "flex:1;" }, [
         el("div", {}, lesson.title),
@@ -1624,6 +1654,36 @@ function CurriculumView() {
     }
     list.appendChild(row);
   });
+
+  // Proactive skip-ahead suggestion for strong performers — shown above the list so
+  // it's the first thing noticed, but easy to dismiss and never nags about the same pair twice.
+  const skipSuggestion = findSkipAheadSuggestion(topic);
+  if (skipSuggestion) {
+    const card = el("div", { class: "new-topic-box", style: "margin-bottom:14px;border-color:var(--moss);" }, [
+      el("div", { style: "font-family:-apple-system,sans-serif;font-size:13px;line-height:1.5;margin-bottom:10px;" },
+        `⚡ You've been getting these right — want to skip "${skipSuggestion.skip.title}" and jump straight to "${skipSuggestion.jumpTo.title}"?`)
+    ]);
+    const row = el("div", { class: "row" });
+    const skipBtn = el("button", { class: "btn-primary" }, "Skip ahead");
+    const declineBtn = el("button", { class: "btn-ghost" }, "No, stick with the plan");
+    skipBtn.addEventListener("click", () => {
+      skipSuggestion.skip.skipped = true;
+      saveTopics();
+      track("lesson_skipped", { topic: topic.title, lesson: skipSuggestion.skip.title });
+      const jumpIdx = topic.lessons.indexOf(skipSuggestion.jumpTo);
+      openLesson(topic.id, jumpIdx);
+    });
+    declineBtn.addEventListener("click", () => {
+      topic.dismissedSkipFor = skipSuggestion.key;
+      saveTopics();
+      render();
+    });
+    row.appendChild(skipBtn);
+    row.appendChild(declineBtn);
+    card.appendChild(row);
+    wrap.appendChild(card);
+  }
+
   wrap.appendChild(list);
 
   const weak = weakConceptTitles(topic);
