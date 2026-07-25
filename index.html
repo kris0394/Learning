@@ -406,6 +406,13 @@ async function loadTopics() {
     }
     const sessionRaw = localStorage.getItem("learn-anything-session");
     if (sessionRaw && !state.session) state.session = JSON.parse(sessionRaw);
+
+    // First-ever visit (no prior topics, no saved session, not arriving via an OAuth
+    // redirect) — show the intro before anything else so new people see what this
+    // actually is before diving into the wizard.
+    if (!raw && !sessionRaw && !hash.includes('token=') && !localStorage.getItem("learn-anything-seen-intro")) {
+      state.view = "intro";
+    }
   } catch (e) { /* no data yet, or storage unavailable (e.g. private browsing) */ }
   updateStreak();
   render();
@@ -1207,6 +1214,7 @@ function App() {
   if (state.view === "curriculum") root.appendChild(CurriculumView());
   if (state.view === "lesson") root.appendChild(LessonView());
   if (state.view === "account") root.appendChild(AccountView());
+  if (state.view === "intro") root.appendChild(IntroView());
 }
 
 function el(tag, attrs, children) {
@@ -1347,6 +1355,53 @@ function AccountView() {
   return wrap;
 }
 
+function IntroView() {
+  const wrap = document.createDocumentFragment();
+
+  const hero = el("div", { style: "text-align:center;padding:8px 0 24px;" }, [
+    el("div", { style: "font-size:40px;margin-bottom:6px;" }, "📖"),
+    el("h2", { style: "font-family:var(--display);font-size:24px;margin:0 0 8px;" }, "Not just another chatbot"),
+    el("p", { style: "font-family:-apple-system,sans-serif;font-size:14.5px;color:#8a8578;max-width:420px;margin:0 auto;line-height:1.5;" },
+      "Learn Anything builds a real curriculum for whatever you want to understand, remembers what you get wrong, and — unlike a quick search — actually shows you where people disagree.")
+  ]);
+  wrap.appendChild(hero);
+
+  const exampleBox = el("div", { class: "new-topic-box", style: "margin-bottom:16px;" });
+  exampleBox.appendChild(el("div", { style: "font-family:-apple-system,sans-serif;font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--moss);margin-bottom:10px;" }, "A real example, from a lesson on \"Coffee Culture Around the World\""));
+  exampleBox.appendChild(el("h3", { style: "font-family:var(--display);font-size:16px;margin:0 0 8px;" }, "Perspectives"));
+  exampleBox.appendChild(el("p", { style: "font-family:var(--body-serif, Georgia, serif);font-size:14.5px;line-height:1.6;margin:0;" },
+    "What counts as \"real\" coffee varies enormously by culture. Italians treat espresso as a quick, standing-at-the-bar ritual, rarely drunk with milk after breakfast. Turkish and Ethiopian traditions center on slow, communal brewing — Ethiopia's coffee ceremony can take over an hour and is deeply social. American coffee culture leans toward large, customizable, on-the-go drinks. None of these is \"the neutral default\" — each reflects a distinct history and set of values around hospitality and time, and this app will always tell you which points are actually agreed upon versus genuinely a matter of taste or tradition."));
+  wrap.appendChild(exampleBox);
+
+  const pointsBox = el("div", { class: "new-topic-box", style: "margin-bottom:20px;" });
+  const points = [
+    ["🧠", "Remembers what you miss", "Wrong quiz answers quietly shape your next lessons — no re-explaining from scratch."],
+    ["🔗", "A real path, not a random list", "Lessons unlock based on what they actually build on, not just a fixed order."],
+    ["📚", "Grounded, not guessed", "Facts are checked against live Wikipedia text and linked sources, not just AI memory."]
+  ];
+  points.forEach(([icon, title, desc], i) => {
+    const row = el("div", { style: "display:flex;gap:12px;align-items:flex-start;" + (i < points.length - 1 ? "margin-bottom:14px;" : "") }, [
+      el("div", { style: "font-size:20px;flex-shrink:0;" }, icon),
+      el("div", {}, [
+        el("div", { style: "font-family:-apple-system,sans-serif;font-weight:600;font-size:14px;margin-bottom:2px;" }, title),
+        el("div", { style: "font-family:-apple-system,sans-serif;font-size:13px;color:#8a8578;line-height:1.4;" }, desc)
+      ])
+    ]);
+    pointsBox.appendChild(row);
+  });
+  wrap.appendChild(pointsBox);
+
+  const startBtn = el("button", { class: "btn-primary", style: "width:100%;" }, "Get started");
+  startBtn.addEventListener("click", () => {
+    localStorage.setItem("learn-anything-seen-intro", "1");
+    state.view = "home";
+    render();
+  });
+  wrap.appendChild(startBtn);
+
+  return wrap;
+}
+
 function HomeView() {
   const wrap = document.createDocumentFragment();
   const topics = Object.values(state.topics).sort((a,b) => b.createdAt - a.createdAt);
@@ -1411,6 +1466,11 @@ function HomeView() {
 
   const startBtn = el("button", { class: "btn-primary", onclick: () => { state.newTopicDraft.step = 1; state.view = "new"; render(); } }, "+ Start a new topic");
   wrap.appendChild(startBtn);
+
+  const aboutLink = el("a", { href: "#", style: "display:block;text-align:center;margin-top:14px;font-family:-apple-system,sans-serif;font-size:12.5px;color:var(--moss);" }, "What makes this different?");
+  aboutLink.addEventListener("click", (e) => { e.preventDefault(); state.view = "intro"; render(); });
+  wrap.appendChild(aboutLink);
+
   return wrap;
 }
 
