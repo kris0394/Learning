@@ -312,7 +312,10 @@ let state = {
   quotaUsedToday: 0,
   quotaDate: null,
   streakCount: 0,
-  lastActiveDate: null
+  lastActiveDate: null,
+  session: null,       // { email, token } once signed in
+  authMode: "login",   // "login" | "signup" | "forgot"
+  syncStatus: "idle"   // idle | syncing | synced | offline | error
 };
 
 function render() { App(); }
@@ -320,16 +323,20 @@ function render() { App(); }
 async function loadTopics() {
   try {
     const raw = localStorage.getItem("learn-anything-topics");
-    if (raw) state.topics = JSON.parse(raw);
+    if (raw) state.topics = JSON.parse(raw); // local cache loads instantly, before any network call
     const streakRaw = localStorage.getItem("learn-anything-streak");
     if (streakRaw) {
       const s = JSON.parse(streakRaw);
       state.streakCount = s.count || 0;
       state.lastActiveDate = s.lastDate || null;
     }
+    const sessionRaw = localStorage.getItem("learn-anything-session");
+    if (sessionRaw) state.session = JSON.parse(sessionRaw);
   } catch (e) { /* no data yet, or storage unavailable (e.g. private browsing) */ }
   updateStreak();
   render();
+
+  if (state.session) await pullFromServer(); // merge in anything saved from another device
 }
 
 function updateStreak() {
@@ -348,10 +355,164 @@ function updateStreak() {
   track("daily_open", { streak: state.streakCount });
 }
 
+let syncDebounceTimer = null;
+
 async function saveTopics() {
+  // Local save is synchronous-feeling and always happens first — the app never
+  // waits on the network to feel responsive, and your data is never only server-side.
   try {
     localStorage.setItem("learn-anything-topics", JSON.stringify(state.topics));
-  } catch (e) { console.error("save failed", e); }
+  } catch (e) { console.error("local save failed", e); }
+
+  if (!state.session) return; // no account set up — local-only is still fully functional
+  clearTimeout(syncDebounceTimer);
+  syncDebounceTimer = setTimeout(() => pushToServer(), 1200); // debounced so rapid edits don't spam the network
+}
+
+// Retries a fetch a couple of times with a short backoff before giving up —
+// covers flaky mobile connections and momentary Worker/network blips.
+async function fetchWithRetry(url, options, attempts = 3) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await fetch(url, options);
+      if (res.ok || res.status < 500) return res; // don't retry real 4xx errors, only network/5xx flakiness
+      lastErr = new Error("Server error " + res.status);
+    } catch (e) {
+      lastErr = e;
+    }
+    if (i < attempts - 1) await new Promise(r => setTimeout(r, 500 * (i + 1)));
+  }
+  throw lastErr;
+}
+
+async function pushToServer() {
+  if (!state.session || !navigator.onLine) { state.syncStatus = "offline"; render(); return; }
+  state.syncStatus = "syncing"; render();
+  try {
+    const res = await fetchWithRetry(WORKER_URL + "/data", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + state.session.token },
+      body: JSON.stringify({ topics: state.topics })
+    });
+    const data = await res.json();
+    if (res.status === 401) { logout(); state.error = "Signed out — please log in again to keep syncing."; }
+    state.syncStatus = data.ok ? "synced" : "error";
+  } catch (e) {
+    state.syncStatus = "error";
+  }
+  render();
+}
+
+async function pullFromServer() {
+  if (!navigator.onLine) { state.syncStatus = "offline"; render(); return; }
+  try {
+    const res = await fetchWithRetry(WORKER_URL + "/data", {
+      method: "GET",
+      headers: { "Authorization": "Bearer " + state.session.token }
+    });
+    if (res.status === 401) { logout(); return; }
+    const data = await res.json();
+    if (data.ok && data.topics) {
+      // Merge rather than blindly overwrite: keep whichever copy of each topic is newer,
+      // so switching devices never silently loses progress made on the one you're on now.
+      const merged = { ...data.topics };
+      for (const [id, localTopic] of Object.entries(state.topics)) {
+        const serverTopic = data.topics[id];
+        if (!serverTopic || (localTopic.lastOpenedAt || 0) > (serverTopic.lastOpenedAt || 0)) {
+          merged[id] = localTopic;
+        }
+      }
+      state.topics = merged;
+      localStorage.setItem("learn-anything-topics", JSON.stringify(state.topics));
+      state.syncStatus = "synced";
+      render();
+    }
+  } catch (e) {
+    state.syncStatus = "error"; render();
+  }
+}
+
+async function signup(email, password) {
+  const res = await fetchWithRetry(WORKER_URL + "/signup", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password })
+  });
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error || "Signup failed");
+  state.session = { email: data.email, token: data.token };
+  localStorage.setItem("learn-anything-session", JSON.stringify(state.session));
+  return data;
+}
+
+async function login(email, password) {
+  const res = await fetchWithRetry(WORKER_URL + "/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password })
+  });
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error || "Login failed");
+  state.session = { email: data.email, token: data.token };
+  localStorage.setItem("learn-anything-session", JSON.stringify(state.session));
+  return data;
+}
+
+async function requestPasswordReset(email) {
+  const res = await fetchWithRetry(WORKER_URL + "/request-reset", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email })
+  });
+  const data = await res.json();
+  if (!data.ok) throw new Error(data.error || "Couldn't send reset email");
+  return data;
+}
+
+function logout() {
+  state.session = null;
+  localStorage.removeItem("learn-anything-session");
+  render();
+}
+
+// Any action that spends AI usage (new lessons, curricula, chat) needs a real
+// account now, since the shared key must be protected from anonymous abuse.
+// Already-cached lessons/topics remain fully browsable without signing in.
+function requireLogin() {
+  if (state.session) return true;
+  state.view = "account";
+  state.error = "Sign in to generate new lessons — protects the shared AI quota from abuse. Browsing what's already loaded doesn't need an account.";
+  render();
+  return false;
+}
+
+// Manual backup, independent of accounts/server — always available as a safety net.
+function exportBackup() {
+  const blob = new Blob([JSON.stringify({ topics: state.topics, exportedAt: new Date().toISOString() }, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "learn-anything-backup-" + new Date().toISOString().slice(0,10) + ".json";
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function importBackup(file) {
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const parsed = JSON.parse(e.target.result);
+      if (!parsed.topics) throw new Error("Not a valid backup file");
+      state.topics = { ...state.topics, ...parsed.topics }; // merge, don't wipe current progress
+      saveTopics();
+      render();
+    } catch (err) {
+      state.error = "Couldn't read that backup file — make sure it's an unmodified export from this app.";
+      render();
+    }
+  };
+  reader.readAsText(file);
 }
 
 function bumpMsgCount() { state.msgCount++; }
@@ -366,6 +527,7 @@ function cleanText(s) {
 }
 
 async function callAI(messages, { json = false, maxTokens = 900 } = {}) {
+  if (!requireLogin()) throw new Error("Sign in required");
   bumpMsgCount();
   let lastErr = null;
   const candidates = await getFreeModelList();
@@ -373,9 +535,11 @@ async function callAI(messages, { json = false, maxTokens = 900 } = {}) {
     try {
       const res = await fetch(API_URL, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "Authorization": "Bearer " + state.session.token },
         body: JSON.stringify({ model, messages, temperature: 0.7, max_tokens: maxTokens })
       });
+      if (res.status === 401) { logout(); throw new Error("Session expired — please sign in again"); }
+      if (res.status === 429) { throw new Error("Daily AI usage limit reached — resets tomorrow"); }
       if (!res.ok) {
         const t = await res.text().catch(()=> "");
         throw new Error("API error " + res.status + ": " + t.slice(0,200));
@@ -390,7 +554,8 @@ async function callAI(messages, { json = false, maxTokens = 900 } = {}) {
       return content;
     } catch (e) {
       lastErr = e;
-      // try next candidate model
+      if (e.message.includes("usage limit") || e.message.includes("Sign in required")) break; // no point trying other models
+      // otherwise try next candidate model
     }
   }
   throw lastErr || new Error("All model candidates failed");
@@ -853,10 +1018,13 @@ function App() {
   root.innerHTML = "";
 
   const isDark = document.body.classList.contains("dark");
+  const syncIcon = { idle: "", syncing: "⟳", synced: "✓", offline: "⚠︎", error: "✗" }[state.syncStatus] || "";
   const header = el("header", { class: "top" }, [
     el("h1", {}, "Learn Anything"),
     el("div", { style: "display:flex;align-items:center;gap:10px;" }, [
       el("span", { class: "tag" }, state.streakCount > 0 ? `🔥 ${state.streakCount} day${state.streakCount===1?"":"s"}` : "personal edition"),
+      el("button", { onclick: () => { state.view = "account"; render(); }, style: "background:none;border:1px solid var(--line);border-radius:50%;width:30px;height:30px;font-size:13px;padding:0;cursor:pointer;position:relative;" },
+        state.session ? "👤" + (syncIcon ? syncIcon : "") : "👤"),
       el("button", { onclick: toggleTheme, style: "background:none;border:1px solid var(--line);border-radius:50%;width:30px;height:30px;font-size:14px;padding:0;cursor:pointer;" }, isDark ? "☀️" : "🌙")
     ])
   ]);
@@ -885,6 +1053,7 @@ function App() {
   if (state.view === "new") root.appendChild(NewTopicView());
   if (state.view === "curriculum") root.appendChild(CurriculumView());
   if (state.view === "lesson") root.appendChild(LessonView());
+  if (state.view === "account") root.appendChild(AccountView());
 }
 
 function el(tag, attrs, children) {
@@ -898,6 +1067,119 @@ function el(tag, attrs, children) {
   else if (Array.isArray(children)) children.forEach(c => c && e.appendChild(typeof c === "string" ? document.createTextNode(c) : c));
   else if (children instanceof Node) e.appendChild(children);
   return e;
+}
+
+function AccountView() {
+  const wrap = document.createDocumentFragment();
+  wrap.appendChild(el("span", { class: "backlink", onclick: () => { state.view = "home"; render(); } }, "← Back"));
+
+  const box = el("div", { class: "new-topic-box" });
+
+  if (!state.session) {
+    const mode = state.authMode || "login"; // "login" | "signup" | "forgot"
+    box.appendChild(el("h2", {}, mode === "signup" ? "Create an account" : mode === "forgot" ? "Reset your password" : "Sign in"));
+    box.appendChild(el("p", { style: "font-family:-apple-system,sans-serif;font-size:13.5px;color:#8a8578;margin-top:-6px;" },
+      "An account backs up your progress across devices and is required to generate new lessons (keeps the shared AI quota fair for everyone). Browsing lessons you've already loaded doesn't need one."));
+
+    const eInput = el("input", { type: "email", placeholder: "email", autocomplete: "email" });
+    box.appendChild(eInput);
+    box.appendChild(el("div", { style: "height:8px;" }));
+
+    if (mode !== "forgot") {
+      const pInput = el("input", { type: "password", placeholder: "password", autocomplete: mode === "signup" ? "new-password" : "current-password" });
+      box.appendChild(pInput);
+
+      const row = el("div", { class: "row" });
+      const goBtn = el("button", { class: "btn-primary" }, mode === "signup" ? "Create account" : "Sign in");
+      goBtn.addEventListener("click", async () => {
+        state.error = null;
+        try {
+          if (mode === "signup") await signup(eInput.value.trim(), pInput.value);
+          else await login(eInput.value.trim(), pInput.value);
+          await pullFromServer();
+          pushToServer(); // also push whatever local progress already existed on this device
+          state.view = "home";
+        } catch (e) {
+          state.error = e.message || "Something went wrong — try again.";
+        }
+        render();
+      });
+      row.appendChild(goBtn);
+      box.appendChild(row);
+
+      const switchLine = el("p", { style: "font-family:-apple-system,sans-serif;font-size:13px;margin-top:14px;" },
+        mode === "signup" ? "Already have an account? " : "New here? ");
+      const switchLink = el("a", { href: "#", style: "color:var(--moss);" }, mode === "signup" ? "Sign in" : "Create one");
+      switchLink.addEventListener("click", (e) => { e.preventDefault(); state.authMode = mode === "signup" ? "login" : "signup"; render(); });
+      switchLine.appendChild(switchLink);
+      box.appendChild(switchLine);
+
+      if (mode === "login") {
+        const forgotLink = el("a", { href: "#", style: "color:var(--moss);font-family:-apple-system,sans-serif;font-size:13px;display:block;margin-top:6px;" }, "Forgot password?");
+        forgotLink.addEventListener("click", (e) => { e.preventDefault(); state.authMode = "forgot"; render(); });
+        box.appendChild(forgotLink);
+      }
+    } else {
+      const row = el("div", { class: "row" });
+      const sendBtn = el("button", { class: "btn-primary" }, "Send reset link");
+      sendBtn.addEventListener("click", async () => {
+        state.error = null;
+        try {
+          await requestPasswordReset(eInput.value.trim());
+          state.error = null;
+          box.appendChild(el("p", { style: "font-family:-apple-system,sans-serif;font-size:13.5px;color:var(--moss);margin-top:10px;" },
+            "If that email has an account, a reset link is on its way. Check your inbox (and spam folder)."));
+        } catch (e) {
+          state.error = e.message || "Couldn't send reset email — try again.";
+        }
+        render();
+      });
+      row.appendChild(sendBtn);
+      box.appendChild(row);
+      const backLink = el("a", { href: "#", style: "color:var(--moss);font-family:-apple-system,sans-serif;font-size:13px;display:block;margin-top:10px;" }, "← Back to sign in");
+      backLink.addEventListener("click", (e) => { e.preventDefault(); state.authMode = "login"; render(); });
+      box.appendChild(backLink);
+    }
+  } else {
+    box.appendChild(el("h2", {}, "👤 " + state.session.email));
+    const statusText = {
+      idle: "Not yet synced this session",
+      syncing: "Syncing...",
+      synced: "✓ Synced — backed up to the server",
+      offline: "⚠︎ Offline — saved locally, will sync when back online",
+      error: "✗ Last sync failed — your data is still safe locally, will retry"
+    }[state.syncStatus] || "";
+    box.appendChild(el("p", { style: "font-family:-apple-system,sans-serif;font-size:13.5px;color:#8a8578;" }, statusText));
+
+    const syncBtn = el("button", { class: "btn-ghost", style: "margin-right:8px;" }, "Sync now");
+    syncBtn.addEventListener("click", () => pushToServer());
+    const logoutBtn = el("button", { class: "btn-ghost" }, "Log out of this device");
+    logoutBtn.addEventListener("click", logout);
+    const row = el("div", { class: "row" });
+    row.appendChild(syncBtn);
+    row.appendChild(logoutBtn);
+    box.appendChild(row);
+  }
+
+  wrap.appendChild(box);
+
+  const backupBox = el("div", { class: "new-topic-box", style: "margin-top:16px;" });
+  backupBox.appendChild(el("h2", {}, "Manual backup"));
+  backupBox.appendChild(el("p", { style: "font-family:-apple-system,sans-serif;font-size:13.5px;color:#8a8578;" },
+    "Works regardless of whether you're signed in — a plain file you keep yourself, as a second safety net."));
+  const backupRow = el("div", { class: "row" });
+  const exportBtn = el("button", { class: "btn-ghost" }, "⬇ Export backup");
+  exportBtn.addEventListener("click", exportBackup);
+  const importLabel = el("label", { class: "btn-ghost", style: "display:inline-block;cursor:pointer;" }, "⬆ Import backup");
+  const importInput = el("input", { type: "file", accept: "application/json", style: "display:none;" });
+  importInput.addEventListener("change", (e) => { if (e.target.files[0]) importBackup(e.target.files[0]); });
+  importLabel.appendChild(importInput);
+  backupRow.appendChild(exportBtn);
+  backupRow.appendChild(importLabel);
+  backupBox.appendChild(backupRow);
+  wrap.appendChild(backupBox);
+
+  return wrap;
 }
 
 function HomeView() {
@@ -1245,6 +1527,13 @@ function toggleTheme() {
   localStorage.setItem("learn-anything-theme", !isDark ? "dark" : "light");
   render();
 }
+window.addEventListener("online", () => {
+  if (state.session) pushToServer(); // reconnected — flush anything that was saved locally while offline
+});
+window.addEventListener("offline", () => {
+  if (state.session) { state.syncStatus = "offline"; render(); }
+});
+
 applyTheme();
 loadTopics();
 </script>
