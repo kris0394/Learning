@@ -1078,9 +1078,21 @@ function AccountView() {
   if (!state.session) {
     const mode = state.authMode || "login"; // "login" | "signup" | "forgot"
     box.appendChild(el("h2", {}, mode === "signup" ? "Create an account" : mode === "forgot" ? "Reset your password" : "Sign in"));
+    
+    // --- ORIGINAL DESCRIPTION TEXT RESTORED ---
     box.appendChild(el("p", { style: "font-family:-apple-system,sans-serif;font-size:13.5px;color:#8a8578;margin-top:-6px;" },
       "An account backs up your progress across devices and is required to generate new lessons (keeps the shared AI quota fair for everyone). Browsing lessons you've already loaded doesn't need one."));
+    // ------------------------------------------
 
+    // --- OAUTH BUTTON ---
+    const oauthBtn = el("a", { 
+      href: WORKER_URL + "/auth/login", 
+      class: "btn-primary", 
+      style: "display:block;text-align:center;text-decoration:none;margin-bottom:16px;background:var(--moss);" 
+    }, "Sign in with OAuth");
+    box.appendChild(oauthBtn);
+
+    box.appendChild(el("div", { style: "text-align:center;font-family:-apple-system,sans-serif;font-size:12px;color:#8a8578;margin-bottom:12px;" }, "— or use email —"));
     const eInput = el("input", { type: "email", placeholder: "email", autocomplete: "email" });
     box.appendChild(eInput);
     box.appendChild(el("div", { style: "height:8px;" }));
