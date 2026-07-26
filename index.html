@@ -313,6 +313,7 @@ let state = {
   quotaDate: null,
   streakCount: 0,
   lastActiveDate: null,
+  lastActiveAt: 0,
   session: null,       // { email, token } once signed in
   authMode: "login",   // "login" | "signup" | "forgot"
   syncStatus: "idle"   // idle | syncing | synced | offline | error
@@ -419,11 +420,13 @@ async function loadTopics() {
     const raw = localStorage.getItem("learn-anything-topics");
     if (raw) state.topics = JSON.parse(raw); // local cache loads instantly, before any network call
     ensureGraphFieldsAll(); // backfill id/prerequisites on any topic saved before the dependency graph existed
+    loadGamification(); // must run before anything (markLessonDone, achievements, etc.) touches state.gamification
     const streakRaw = localStorage.getItem("learn-anything-streak");
     if (streakRaw) {
       const s = JSON.parse(streakRaw);
       state.streakCount = s.count || 0;
       state.lastActiveDate = s.lastDate || null;
+      state.lastActiveAt = s.lastAt || 0;
     }
     const sessionRaw = localStorage.getItem("learn-anything-session");
     if (sessionRaw && !state.session) state.session = JSON.parse(sessionRaw);
@@ -440,19 +443,101 @@ async function loadTopics() {
 
   if (state.session) await pullFromServer(); // merge in anything saved from another device
 }
+// ============================== GAMIFICATION ==============================
+// Synced to the server alongside topics (same debounced push/merge-on-pull pattern),
+// so XP, streaks, and unlocked achievements follow you to a new device — not just
+// local-only. XP and achievements are meant to reflect real actions (lessons
+// finished, correct answers, streaks kept), not just clicks.
+
+const XP_LEVELS = [0, 100, 250, 500, 900, 1400, 2000, 2800, 3800, 5000]; // xp needed for level 1,2,3...
+
+const ACHIEVEMENTS = [
+  { id: "first_lesson", icon: "🌱", title: "First Steps", desc: "Complete your first lesson", check: (g, topics) => totalLessonsDone(topics) >= 1 },
+  { id: "curious", icon: "🔭", title: "Curious Mind", desc: "Start 3 different topics", check: (g, topics) => Object.keys(topics).length >= 3 },
+  { id: "streak_3", icon: "🔥", title: "On a Roll", desc: "Keep a 3-day streak", check: () => state.streakCount >= 3 },
+  { id: "streak_7", icon: "🔥", title: "Dedicated", desc: "Keep a 7-day streak", check: () => state.streakCount >= 7 },
+  { id: "ten_lessons", icon: "📚", title: "Deep Diver", desc: "Complete 10 lessons total", check: (g, topics) => totalLessonsDone(topics) >= 10 },
+  { id: "well_rounded", icon: "🧭", title: "Well Rounded", desc: "Complete a lesson in 3 different topics", check: (g, topics) => Object.values(topics).filter(t => t.lessons.some(l => l.done)).length >= 3 },
+  { id: "perfectionist", icon: "🎯", title: "Perfectionist", desc: "Get every quiz question right on 5 lessons", check: (g) => (g.perfectLessons || 0) >= 5 },
+  { id: "comeback", icon: "🔄", title: "Comeback", desc: "Complete a review lesson", check: (g) => (g.reviewsCompleted || 0) >= 1 },
+  { id: "level_5", icon: "⭐", title: "Well Established", desc: "Reach level 5", check: (g) => xpLevel(g.xp || 0) >= 5 },
+];
+
+function xpLevel(xp) {
+  let lvl = 1;
+  for (let i = 1; i < XP_LEVELS.length; i++) { if (xp >= XP_LEVELS[i]) lvl = i + 1; }
+  return lvl;
+}
+function xpForNextLevel(xp) {
+  const lvl = xpLevel(xp);
+  return lvl - 1 < XP_LEVELS.length ? XP_LEVELS[lvl - 1] ?? null : null; // null once past the defined curve — still counts, just no more level-ups tracked
+}
+function totalLessonsDone(topics) {
+  return Object.values(topics).reduce((sum, t) => sum + t.lessons.filter(l => l.done).length, 0);
+}
+
+function loadGamification() {
+  try {
+    const raw = localStorage.getItem("learn-anything-gamification");
+    if (raw) state.gamification = JSON.parse(raw);
+  } catch (e) { /* fresh start */ }
+  if (!state.gamification) state.gamification = { xp: 0, unlocked: {}, completionLog: [], perfectLessons: 0, reviewsCompleted: 0, weeklyGoal: 5 };
+}
+function saveGamification() {
+  try { localStorage.setItem("learn-anything-gamification", JSON.stringify(state.gamification)); } catch (e) { /* ignore */ }
+  if (state.session) { // debounced, same pattern as saveTopics — cheap to call often
+    clearTimeout(syncDebounceTimer);
+    syncDebounceTimer = setTimeout(() => pushToServer(), 1200);
+  }
+}
+
+// Awards XP and checks for newly-unlocked achievements in one place, so every XP-earning
+// action stays consistent. Newly unlocked achievements queue up as a dismissible toast.
+function awardXp(amount, reason) {
+  const g = state.gamification;
+  g.xp = (g.xp || 0) + amount;
+  checkAchievements();
+  saveGamification();
+  track("xp_awarded", { amount, reason });
+}
+function checkAchievements() {
+  const g = state.gamification;
+  ACHIEVEMENTS.forEach(a => {
+    if (g.unlocked[a.id]) return;
+    if (a.check(g, state.topics)) {
+      g.unlocked[a.id] = Date.now();
+      state.achievementToast = a; // shown once, dismissed manually or replaced by the next unlock
+    }
+  });
+}
+function lessonsThisWeek() {
+  const now = new Date();
+  const day = now.getDay() || 7; // Monday-start week
+  const monday = new Date(now); monday.setHours(0,0,0,0); monday.setDate(now.getDate() - day + 1);
+  return (state.gamification.completionLog || []).filter(ts => ts >= monday.getTime()).length;
+}
+function setWeeklyGoal(n) {
+  state.gamification.weeklyGoal = Math.max(1, Math.min(50, n));
+  saveGamification();
+  render();
+}
+
 function updateStreak() {
   const today = new Date().toDateString();
   if (state.lastActiveDate === today) return; // already counted today
   const yesterday = new Date(Date.now() - 86400000).toDateString();
-  if (state.lastActiveDate === yesterday) {
+  const wasContinuing = state.lastActiveDate === yesterday;
+  if (wasContinuing) {
     state.streakCount += 1; // kept the streak going
   } else {
     state.streakCount = 1; // streak broken or first ever visit
   }
   state.lastActiveDate = today;
+  state.lastActiveAt = Date.now(); // epoch timestamp, used to resolve which device's streak is more current on sync
   try {
-    localStorage.setItem("learn-anything-streak", JSON.stringify({ count: state.streakCount, lastDate: today }));
+    localStorage.setItem("learn-anything-streak", JSON.stringify({ count: state.streakCount, lastDate: today, lastAt: state.lastActiveAt }));
   } catch (e) { /* ignore */ }
+  if (wasContinuing && state.streakCount > 1) awardXp(5, "streak_continued"); // small, frequent nudge — not on day 1
   track("daily_open", { streak: state.streakCount });
 }
 
@@ -487,6 +572,18 @@ async function fetchWithRetry(url, options, attempts = 3) {
   throw lastErr;
 }
 
+// Builds the full payload sent to the server — topics plus gamification/streak,
+// versioned so pullFromServer can tell this apart from the older flat-topics-only
+// format that earlier app versions saved (avoids breaking anyone mid-upgrade).
+function buildSyncPayload() {
+  return {
+    __v: 2,
+    topics: state.topics,
+    gamification: state.gamification,
+    streak: { count: state.streakCount, lastActiveDate: state.lastActiveDate, lastActiveAt: state.lastActiveAt }
+  };
+}
+
 async function pushToServer() {
   if (!state.session || !navigator.onLine) { state.syncStatus = "offline"; render(); return; }
   state.syncStatus = "syncing"; render();
@@ -494,7 +591,7 @@ async function pushToServer() {
     const res = await fetchWithRetry(WORKER_URL + "/data", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Authorization": "Bearer " + state.session.token },
-      body: JSON.stringify({ topics: state.topics })
+      body: JSON.stringify({ topics: buildSyncPayload() })
     });
     const data = await res.json();
     if (res.status === 401) { logout(); state.error = "Signed out — please log in again to keep syncing."; }
@@ -503,6 +600,29 @@ async function pushToServer() {
     state.syncStatus = "error";
   }
   render();
+}
+
+// Combines two gamification objects from different devices without ever losing progress:
+// XP and lifetime counters take the higher value (both should only ever grow), achievement
+// unlocks are unioned (keeping the earliest unlock time if both sides have it), and the
+// weekly goal target/log are unioned by timestamp so a goal set on one device isn't lost.
+function mergeGamification(local, server) {
+  if (!server) return local;
+  if (!local) return server;
+  const unlocked = { ...server.unlocked };
+  for (const [id, ts] of Object.entries(local.unlocked || {})) {
+    unlocked[id] = unlocked[id] ? Math.min(unlocked[id], ts) : ts;
+  }
+  const logSet = new Map();
+  [...(server.completionLog || []), ...(local.completionLog || [])].forEach(ts => logSet.set(ts, ts));
+  return {
+    xp: Math.max(local.xp || 0, server.xp || 0),
+    unlocked,
+    completionLog: [...logSet.values()].sort((a, b) => a - b).slice(-500),
+    perfectLessons: Math.max(local.perfectLessons || 0, server.perfectLessons || 0),
+    reviewsCompleted: Math.max(local.reviewsCompleted || 0, server.reviewsCompleted || 0),
+    weeklyGoal: local.weeklyGoal || server.weeklyGoal || 5 // most-recently-set-locally wins; goal target itself isn't time-stamped, this is a reasonable default
+  };
 }
 
 async function pullFromServer() {
@@ -515,11 +635,16 @@ async function pullFromServer() {
     if (res.status === 401) { logout(); return; }
     const data = await res.json();
     if (data.ok && data.topics) {
+      const isWrapped = data.topics && data.topics.__v === 2;
+      const serverTopics = isWrapped ? data.topics.topics : data.topics; // backward compatible with pre-gamification saves
+      const serverGamification = isWrapped ? data.topics.gamification : null;
+      const serverStreak = isWrapped ? data.topics.streak : null;
+
       // Merge rather than blindly overwrite: keep whichever copy of each topic is newer,
       // so switching devices never silently loses progress made on the one you're on now.
-      const merged = { ...data.topics };
+      const merged = { ...serverTopics };
       for (const [id, localTopic] of Object.entries(state.topics)) {
-        const serverTopic = data.topics[id];
+        const serverTopic = serverTopics ? serverTopics[id] : null;
         if (!serverTopic || (localTopic.lastOpenedAt || 0) > (serverTopic.lastOpenedAt || 0)) {
           merged[id] = localTopic;
         }
@@ -527,6 +652,20 @@ async function pullFromServer() {
       state.topics = merged;
       ensureGraphFieldsAll(); // backfill for any topic (local or server) saved before the dependency graph existed
       localStorage.setItem("learn-anything-topics", JSON.stringify(state.topics));
+
+      state.gamification = mergeGamification(state.gamification, serverGamification);
+      localStorage.setItem("learn-anything-gamification", JSON.stringify(state.gamification));
+
+      // Streak: trust whichever device was active more recently — it's the more
+      // authoritative account of whether the streak is still alive today.
+      if (serverStreak && (serverStreak.lastActiveAt || 0) > (state.lastActiveAt || 0)) {
+        state.streakCount = serverStreak.count || 0;
+        state.lastActiveDate = serverStreak.lastActiveDate || null;
+        state.lastActiveAt = serverStreak.lastActiveAt || 0;
+        localStorage.setItem("learn-anything-streak", JSON.stringify({ count: state.streakCount, lastDate: state.lastActiveDate, lastAt: state.lastActiveAt }));
+      }
+
+      checkAchievements(); // in case merged progress alone crosses a new threshold
       state.syncStatus = "synced";
       render();
     }
@@ -953,11 +1092,19 @@ async function openLesson(topicId, idx) {
   render();
 }
 
-function markLessonDone(topicId, idx) {
+function markLessonDone(topicId, idx, wasPerfect) {
   const topic = state.topics[topicId];
-  topic.lessons[idx].done = true;
+  const lesson = topic.lessons[idx];
+  lesson.done = true;
   saveTopics();
-  track("lesson_completed", { topic: topic.title, lesson: topic.lessons[idx].title });
+  track("lesson_completed", { topic: topic.title, lesson: lesson.title });
+
+  const g = state.gamification;
+  g.completionLog = [...(g.completionLog || []), Date.now()].slice(-500);
+  if (wasPerfect) g.perfectLessons = (g.perfectLessons || 0) + 1;
+  if (lesson.isReview || lesson.isDailyReview) g.reviewsCompleted = (g.reviewsCompleted || 0) + 1;
+  awardXp(20, "lesson_completed"); // awardXp already saves gamification + checks achievements
+
   render();
 }
 
@@ -1178,16 +1325,29 @@ function App() {
 
   const isDark = document.body.classList.contains("dark");
   const syncIcon = { idle: "", syncing: "⟳", synced: "✓", offline: "⚠︎", error: "✗" }[state.syncStatus] || "";
+  const lvl = xpLevel(state.gamification.xp || 0);
+  const statsTag = el("span", { class: "tag", style: "cursor:pointer;", onclick: () => { state.view = "achievements"; render(); } },
+    `⭐ Lv.${lvl}${state.streakCount > 0 ? ` · 🔥 ${state.streakCount}` : ""}`);
   const header = el("header", { class: "top" }, [
     el("h1", {}, "Learn Anything"),
     el("div", { style: "display:flex;align-items:center;gap:10px;" }, [
-      el("span", { class: "tag" }, state.streakCount > 0 ? `🔥 ${state.streakCount} day${state.streakCount===1?"":"s"}` : "personal edition"),
+      statsTag,
       el("button", { onclick: () => { state.view = "account"; render(); }, style: "background:none;border:1px solid var(--line);border-radius:50%;width:30px;height:30px;font-size:13px;padding:0;cursor:pointer;position:relative;" },
         state.session ? "👤" + (syncIcon ? syncIcon : "") : "👤"),
       el("button", { onclick: toggleTheme, style: "background:none;border:1px solid var(--line);border-radius:50%;width:30px;height:30px;font-size:14px;padding:0;cursor:pointer;" }, isDark ? "☀️" : "🌙")
     ])
   ]);
   root.appendChild(header);
+
+  if (state.achievementToast) {
+    const a = state.achievementToast;
+    const toast = el("div", { class: "error-box", style: "background:#eef2ee;border-color:var(--moss);color:#2c4232;display:flex;justify-content:space-between;align-items:center;gap:10px;" }, [
+      el("span", {}, `${a.icon} Achievement unlocked: ${a.title} — ${a.desc}`),
+      el("button", { class: "btn-ghost", style: "font-size:11px;padding:5px 10px;flex-shrink:0;" }, "Nice!")
+    ]);
+    toast.lastChild.addEventListener("click", () => { state.achievementToast = null; render(); });
+    root.appendChild(toast);
+  }
 
   const used = state.msgCount;
   const remaining = Math.max(ASSUMED_BUDGET - used, 0);
@@ -1236,6 +1396,7 @@ function App() {
   if (state.view === "curriculum") root.appendChild(CurriculumView());
   if (state.view === "lesson") root.appendChild(LessonView());
   if (state.view === "account") root.appendChild(AccountView());
+  if (state.view === "achievements") root.appendChild(AchievementsView());
   if (state.view === "intro") root.appendChild(IntroView());
 }
 
@@ -1250,6 +1411,72 @@ function el(tag, attrs, children) {
   else if (Array.isArray(children)) children.forEach(c => c && e.appendChild(typeof c === "string" ? document.createTextNode(c) : c));
   else if (children instanceof Node) e.appendChild(children);
   return e;
+}
+
+function AchievementsView() {
+  const wrap = document.createDocumentFragment();
+  wrap.appendChild(el("span", { class: "backlink", onclick: () => { state.view = "home"; render(); } }, "← Back"));
+
+  const g = state.gamification;
+  const xp = g.xp || 0;
+  const lvl = xpLevel(xp);
+  const nextThreshold = xpForNextLevel(xp);
+  const prevThreshold = XP_LEVELS[lvl - 1] ?? 0;
+  const pctToNext = nextThreshold ? Math.round(((xp - prevThreshold) / (nextThreshold - prevThreshold)) * 100) : 100;
+
+  const xpBox = el("div", { class: "new-topic-box", style: "margin-bottom:14px;" });
+  xpBox.appendChild(el("h2", {}, `⭐ Level ${lvl}`));
+  xpBox.appendChild(el("div", { style: "font-family:-apple-system,sans-serif;font-size:13px;color:#8a8578;margin-bottom:8px;" },
+    nextThreshold ? `${xp} XP — ${nextThreshold - xp} to level ${lvl + 1}` : `${xp} XP — max level reached`));
+  xpBox.appendChild(el("div", { class: "bar-track", style: "width:100%;height:8px;" },
+    el("div", { class: "bar-fill", style: `width:${pctToNext}%` })));
+  if (state.streakCount > 0) {
+    xpBox.appendChild(el("div", { style: "font-family:-apple-system,sans-serif;font-size:13px;color:#8a8578;margin-top:12px;" },
+      `🔥 ${state.streakCount} day streak — keep it going by opening the app daily`));
+  }
+  wrap.appendChild(xpBox);
+
+  // Weekly goal — the tracking logic (lessonsThisWeek/setWeeklyGoal) already existed;
+  // this is the first place either is actually surfaced to the learner.
+  const goalBox = el("div", { class: "new-topic-box", style: "margin-bottom:14px;" });
+  const doneThisWeek = lessonsThisWeek();
+  const goalTarget = g.weeklyGoal || 5;
+  const goalPct = Math.min(100, Math.round((doneThisWeek / goalTarget) * 100));
+  goalBox.appendChild(el("h2", {}, "🎯 This week's goal"));
+  goalBox.appendChild(el("div", { style: "font-family:-apple-system,sans-serif;font-size:13px;color:#8a8578;margin-bottom:8px;" },
+    `${doneThisWeek} of ${goalTarget} lessons${doneThisWeek >= goalTarget ? " — goal met! 🎉" : ""}`));
+  goalBox.appendChild(el("div", { class: "bar-track", style: "width:100%;height:8px;" },
+    el("div", { class: "bar-fill", style: `width:${goalPct}%;${doneThisWeek >= goalTarget ? "background:var(--clay);" : ""}` })));
+  const goalRow = el("div", { class: "row", style: "margin-top:12px;align-items:center;" });
+  goalRow.appendChild(el("span", { style: "font-family:-apple-system,sans-serif;font-size:13px;" }, "Lessons per week:"));
+  const goalInput = el("input", { type: "number", min: "1", max: "50", style: "width:70px;padding:8px;" });
+  goalInput.value = goalTarget;
+  const saveGoalBtn = el("button", { class: "btn-ghost" }, "Update");
+  saveGoalBtn.addEventListener("click", () => setWeeklyGoal(parseInt(goalInput.value, 10) || 5));
+  goalRow.appendChild(goalInput);
+  goalRow.appendChild(saveGoalBtn);
+  goalBox.appendChild(goalRow);
+  wrap.appendChild(goalBox);
+
+  const achBox = el("div", { class: "new-topic-box" });
+  achBox.appendChild(el("h2", {}, "🏅 Achievements"));
+  const grid = el("div", { style: "display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:8px;" });
+  ACHIEVEMENTS.forEach(a => {
+    const unlocked = !!(g.unlocked && g.unlocked[a.id]);
+    const card = el("div", {
+      style: `border:1px solid var(--line);border-radius:6px;padding:12px;text-align:center;` +
+             (unlocked ? "background:var(--card);" : "background:transparent;opacity:0.45;")
+    }, [
+      el("div", { style: "font-size:26px;margin-bottom:6px;" }, a.icon),
+      el("div", { style: "font-family:var(--display);font-size:13px;font-weight:600;margin-bottom:3px;" }, a.title),
+      el("div", { style: "font-family:-apple-system,sans-serif;font-size:11px;color:#8a8578;" }, a.desc)
+    ]);
+    grid.appendChild(card);
+  });
+  achBox.appendChild(grid);
+  wrap.appendChild(achBox);
+
+  return wrap;
 }
 
 function AccountView() {
@@ -1744,6 +1971,7 @@ function LessonView() {
             optBtn.insertAdjacentHTML("beforeend", `<div style="font-family:-apple-system,sans-serif;font-size:12px;margin-top:4px;font-weight:400;">${correct ? "✓ Correct — " : "✗ "}${q.explanation}</div>`);
             recordQuizAnswer(topic.id, lesson.title, q.question, correct);
             track("quiz_answered", { topic: topic.title, correct });
+            if (correct) awardXp(5, "quiz_correct");
             quizResults[qi] = correct;
           });
           optWrap.appendChild(optBtn);
@@ -1769,7 +1997,8 @@ function LessonView() {
         const answered = quizResults.filter(r => r !== undefined);
         const correctCount = answered.filter(Boolean).length;
         const scoreLow = answered.length > 0 && (correctCount / answered.length) < 0.5;
-        markLessonDone(topic.id, idx);
+        const wasPerfect = answered.length > 0 && correctCount === answered.length;
+        markLessonDone(topic.id, idx, wasPerfect);
         if (scoreLow && !lesson.isReview) {
           state.error = null;
           openReviewLesson(topic.id); // adaptive: low score triggers an immediate targeted bridge lesson
