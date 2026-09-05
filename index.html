@@ -1009,22 +1009,23 @@ async function generateLessonContent(topic, lesson, idx) {
     : "";
 
   const sys = `You are a patient, engaging tutor writing a single self-contained MICRO-LESSON meant to be read in under 5 minutes — think bite-sized daily lesson, not a textbook chapter. Output ONLY valid JSON (no markdown fences) with this shape:
-{"content_html": "string of simple HTML using <p>,<h3>,<ul>,<li>,<strong>,<em> only", "quiz": [{"question":"string","options":["a","b","c","d"],"correctIndex":0,"explanation":"string"}]}
+{"content_html": "string of simple HTML using <p>,<h3>,<ul>,<li>,<strong>,<em> only", "quiz": [{"question":"string","options":["a","b","c","d"],"correctIndex":0,"explanation":"string"}], "takeaway": "one sentence capturing the single most important idea from this lesson"}
 The content_html should include sections (use <h3> headers), in this order:
 1. Introduction — the core idea, plainly stated.
 2. An Example — concrete and specific.
 3. An Analogy — to make it stick.
 4. Perspectives — IMPORTANT: if this topic has more than one scholarly, cultural, or traditional viewpoint (this is especially true for religion, history, philosophy, or any topic where interpretations differ), briefly name 2-3 distinct perspectives side by side and be explicit about which points are broadly agreed upon versus actively debated or interpreted differently across traditions/scholars. Never present one tradition's view as the neutral default. If the topic is genuinely a single-consensus factual matter (e.g. basic arithmetic), this section can instead briefly note that it's well-established and skip straight to Practice.
 5. Practice/Summary — a short recap.
-Keep each section to 2-4 short sentences — total reading time under 5 minutes even with the Perspectives section included. Write for a "${topic.level}" learner who prefers a "${topic.style}" style.${countryLine}${memoryLine} Include exactly 2 quiz questions (in the quiz array, not in content_html) — at least one should test understanding of a perspective/nuance, not just a fact. Keep quiz explanations to one short sentence. Do not use markdown asterisks for bold/italic — use the actual HTML tags instead.${groundingLine}`;
+Keep each section to 2-4 short sentences — total reading time under 5 minutes even with the Perspectives section included. Write for a "${topic.level}" learner who prefers a "${topic.style}" style.${countryLine}${memoryLine} Include 4 to 5 quiz questions (in the quiz array, not in content_html), covering different parts of the lesson (not all on the same fact) — at least one should test understanding of a perspective/nuance, not just a fact. Keep quiz explanations to one short sentence. Do not use markdown asterisks for bold/italic — use the actual HTML tags instead.${groundingLine}`;
   const user = `Topic: ${topic.title}\nLesson: "${lesson.title}"\nLessons already covered: ${priorTitles}`;
 
   const result = await callAI([
     { role: "system", content: sys },
     { role: "user", content: user }
-  ], { json: true, maxTokens: 900 });
+  ], { json: true, maxTokens: 1100 });
 
   lesson.content = result.content_html;
+  lesson.takeaway = result.takeaway ? cleanText(result.takeaway) : null;
   lesson.quiz = (result.quiz || []).map(q => ({
     ...q,
     question: cleanText(q.question),
@@ -1039,6 +1040,7 @@ Keep each section to 2-4 short sentences — total reading time under 5 minutes 
 
 let prefetchInFlight = new Set(); // guards against double-prefetching the same lesson
 let prefetchStatus = {}; // "topicId:idx" -> "loading" | "done", purely for the visible indicator
+let takeawaySession = null; // in-memory only — { queue, index, flipped, browsing } for the current deck pass
 
 // Silently generates the next lesson in the background while the learner is still
 // reading the current one. Never touches loading/error state — if it fails, the
@@ -1225,6 +1227,31 @@ function dueForReview(topic) {
 }
 function anyTopicDueForReview() {
   return Object.values(state.topics).find(t => dueForReview(t).length > 0) || null;
+}
+
+// Personal takeaway deck (see fsrsUpdate above for the shared scheduling engine).
+// Each lesson's one-sentence takeaway is its own spaced-repetition item, tracked
+// on the lesson itself (lesson.takeawayReview) so it rides along with normal sync
+// — no separate storage, no schema change needed on the server.
+function allTakeaways() {
+  const out = [];
+  Object.values(state.topics).forEach(t => {
+    (t.lessons || []).forEach((l, idx) => {
+      if (l.takeaway) out.push({ topicId: t.id, topicTitle: t.title, lessonIdx: idx, lessonTitle: l.title, takeaway: l.takeaway, review: l.takeawayReview });
+    });
+  });
+  return out;
+}
+function dueTakeaways() {
+  const now = Date.now();
+  return allTakeaways()
+    .filter(t => !t.review || !t.review.dueAt || t.review.dueAt < now)
+    .sort((a, b) => (a.review?.dueAt || 0) - (b.review?.dueAt || 0));
+}
+function recordTakeawayReview(topicId, lessonIdx, gotIt) {
+  const lesson = state.topics[topicId].lessons[lessonIdx];
+  lesson.takeawayReview = fsrsUpdate(lesson.takeawayReview, gotIt, Date.now());
+  saveTopics();
 }
 
 async function sendChat(topicId, idx, text, quickAction) {
@@ -1482,6 +1509,7 @@ function App() {
   if (state.view === "lesson") root.appendChild(LessonView());
   if (state.view === "account") root.appendChild(AccountView());
   if (state.view === "achievements") root.appendChild(AchievementsView());
+  if (state.view === "takeaways") root.appendChild(TakeawayDeckView());
   if (state.view === "intro") root.appendChild(IntroView());
 }
 
@@ -1560,6 +1588,75 @@ function AchievementsView() {
   });
   achBox.appendChild(grid);
   wrap.appendChild(achBox);
+
+  return wrap;
+}
+
+function openTakeawayDeck() {
+  const due = dueTakeaways();
+  const queue = due.length > 0 ? due : allTakeaways();
+  takeawaySession = { queue, index: 0, flipped: false, browsing: due.length === 0 };
+  state.view = "takeaways";
+  render();
+}
+
+function TakeawayDeckView() {
+  const wrap = document.createDocumentFragment();
+  wrap.appendChild(el("span", { class: "backlink", onclick: () => { state.view = "home"; render(); } }, "← Back"));
+
+  if (!takeawaySession || takeawaySession.queue.length === 0) {
+    wrap.appendChild(el("div", { class: "new-topic-box" }, [
+      el("h2", {}, "📇 Key ideas"),
+      el("p", { style: "font-family:-apple-system,sans-serif;color:#8a8578;" }, "No takeaways yet — finish a few lessons and they'll start showing up here.")
+    ]));
+    return wrap;
+  }
+
+  const { queue, index, flipped, browsing } = takeawaySession;
+  if (index >= queue.length) {
+    wrap.appendChild(el("div", { class: "new-topic-box", style: "text-align:center;" }, [
+      el("div", { style: "font-size:32px;margin-bottom:8px;" }, "✅"),
+      el("h2", {}, "All caught up"),
+      el("p", { style: "font-family:-apple-system,sans-serif;color:#8a8578;" }, "You've been through every key idea due for review.")
+    ]));
+    return wrap;
+  }
+
+  const card = queue[index];
+  const box = el("div", {
+    class: "new-topic-box",
+    style: "text-align:center;min-height:180px;display:flex;flex-direction:column;justify-content:center;cursor:pointer;"
+  });
+  box.appendChild(el("div", {
+    style: "font-family:-apple-system,sans-serif;font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#8a8578;margin-bottom:10px;"
+  }, browsing ? "Browsing all key ideas" : `Card ${index + 1} of ${queue.length}`));
+  box.appendChild(el("div", { style: "font-family:var(--display);font-size:13px;color:var(--moss);margin-bottom:8px;" }, card.topicTitle));
+
+  if (!flipped) {
+    box.appendChild(el("h3", { style: "margin:0 0 6px;" }, card.lessonTitle));
+    box.appendChild(el("div", { style: "font-family:-apple-system,sans-serif;font-size:13px;color:#8a8578;" }, "Tap to reveal the key idea"));
+    box.addEventListener("click", () => { takeawaySession.flipped = true; render(); });
+  } else {
+    box.appendChild(el("p", { style: "font-family:var(--display);font-size:17px;line-height:1.5;margin:0;" }, card.takeaway));
+  }
+  wrap.appendChild(box);
+
+  if (flipped) {
+    const btnRow = el("div", { class: "row", style: "margin-top:14px;gap:10px;" });
+    const advance = (gotIt) => {
+      recordTakeawayReview(card.topicId, card.lessonIdx, gotIt);
+      takeawaySession.index++;
+      takeawaySession.flipped = false;
+      render();
+    };
+    const fuzzyBtn = el("button", { class: "btn-ghost", style: "flex:1;" }, "😅 Still fuzzy");
+    const gotItBtn = el("button", { class: "btn-primary", style: "flex:1;" }, "✅ Got it");
+    fuzzyBtn.addEventListener("click", () => advance(false));
+    gotItBtn.addEventListener("click", () => advance(true));
+    btnRow.appendChild(fuzzyBtn);
+    btnRow.appendChild(gotItBtn);
+    wrap.appendChild(btnRow);
+  }
 
   return wrap;
 }
@@ -1756,6 +1853,24 @@ function HomeView() {
       el("span", { style: "font-size:20px;" }, "→")
     ]);
     wrap.appendChild(reviewCard);
+  }
+
+  const takeawayCount = allTakeaways().length;
+  if (takeawayCount > 0) {
+    const dueCount = dueTakeaways().length;
+    const deckCard = el("div", {
+      class: "topic-card",
+      style: "background:var(--card);margin-bottom:14px;",
+      onclick: openTakeawayDeck
+    }, [
+      el("div", {}, [
+        el("div", { style: "font-family:-apple-system,sans-serif;font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#8a8578;margin-bottom:4px;" }, "📇 Review your key ideas"),
+        el("h3", { style: "margin:0 0 2px;" }, dueCount > 0 ? `${dueCount} ready to review` : "All caught up — browse anytime"),
+        el("div", { class: "meta" }, `${takeawayCount} key idea${takeawayCount === 1 ? "" : "s"} collected so far`)
+      ]),
+      el("span", { style: "font-size:20px;" }, "→")
+    ]);
+    wrap.appendChild(deckCard);
   }
 
   const withActivity = topics.filter(t => t.lastOpenedAt).sort((a,b) => b.lastOpenedAt - a.lastOpenedAt);
