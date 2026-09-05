@@ -1108,23 +1108,87 @@ function markLessonDone(topicId, idx, wasPerfect) {
   render();
 }
 
-// Records right/wrong answers per topic so future lessons and chat can reinforce weak areas.
-// Backward compatible: old saved topics won't have this field until their first new answer.
+// --- FSRS (Free Spaced Repetition Scheduler) ---
+// A small, dependency-free implementation of the open FSRS v4.5 algorithm
+// (same family used by Anki), adapted for a right/wrong quiz instead of a
+// 4-button rating: a correct answer maps to FSRS rating "Good" (3), an
+// incorrect one to "Again" (1). Pure math, no API cost, no external library.
+const FSRS_W = [0.4072, 1.1829, 3.1262, 15.4722, 7.2102, 0.5316, 1.0651, 0.0234, 1.616, 0.1544, 1.0824, 1.9813, 0.0953, 0.2975, 2.2042, 0.2407, 2.9466, 0.5034, 0.6567];
+const FSRS_DECAY = -0.5;
+const FSRS_FACTOR = 19 / 81;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+// Probability of still remembering, given days elapsed and current stability.
+function fsrsRetrievability(elapsedDays, stability) {
+  return Math.pow(1 + FSRS_FACTOR * elapsedDays / stability, FSRS_DECAY);
+}
+function fsrsInitialStability(rating) {
+  return Math.max(0.1, FSRS_W[rating === 3 ? 2 : 0]);
+}
+function fsrsInitialDifficulty(rating) {
+  return Math.min(10, Math.max(1, FSRS_W[4] - (rating - 3) * FSRS_W[5]));
+}
+function fsrsNextDifficulty(d, rating) {
+  const dPrime = d + (-FSRS_W[6] * (rating - 3)) * ((10 - d) / 9);
+  const target = fsrsInitialDifficulty(3); // mean-reverts gently toward the "Good" baseline
+  return Math.min(10, Math.max(1, FSRS_W[7] * target + (1 - FSRS_W[7]) * dPrime));
+}
+function fsrsNextStability(d, s, r, rating) {
+  if (rating === 1) {
+    // wrong answer ("lapse") — interval shrinks based on current difficulty/stability
+    return Math.max(0.1, FSRS_W[11] * Math.pow(d, -FSRS_W[12]) * (Math.pow(s + 1, FSRS_W[13]) - 1) * Math.exp((1 - r) * FSRS_W[14]));
+  }
+  // correct answer — interval grows, more so if it was recalled after a longer gap
+  return s * (1 + Math.exp(FSRS_W[8]) * (11 - d) * Math.pow(s, -FSRS_W[9]) * (Math.exp((1 - r) * FSRS_W[10]) - 1));
+}
+// Given a question's existing FSRS state (or none, for a fresh item) and whether
+// this answer was correct, returns the updated { stability, difficulty, reps, lapses, dueAt }.
+function fsrsUpdate(item, wasCorrect, now) {
+  const rating = wasCorrect ? 3 : 1;
+  if (!item || !item.stability) {
+    const stability = fsrsInitialStability(rating);
+    const difficulty = fsrsInitialDifficulty(rating);
+    return { stability, difficulty, reps: 1, lapses: wasCorrect ? 0 : 1, dueAt: now + stability * DAY_MS };
+  }
+  const elapsedDays = Math.max(0, (now - (item.at || now)) / DAY_MS);
+  const r = fsrsRetrievability(elapsedDays, item.stability);
+  const difficulty = fsrsNextDifficulty(item.difficulty, rating);
+  const stability = fsrsNextStability(item.difficulty, item.stability, r, rating);
+  return {
+    stability, difficulty,
+    reps: (item.reps || 0) + 1,
+    lapses: (item.lapses || 0) + (wasCorrect ? 0 : 1),
+    dueAt: now + stability * DAY_MS
+  };
+}
+
+// Records right/wrong answers per topic so future lessons and chat can reinforce weak areas,
+// and keeps each question's FSRS scheduling state up to date.
+// Backward compatible: old saved topics won't have this field, or FSRS fields on existing
+// entries, until their first new answer — no migration needed, they just start fresh then.
 function recordQuizAnswer(topicId, lessonTitle, question, wasCorrect) {
   const topic = state.topics[topicId];
   if (!topic.profile) topic.profile = { weak: [], strong: [] };
-  const entry = { lesson: lessonTitle, question, at: Date.now() };
+  const now = Date.now();
+
   if (wasCorrect) {
-    topic.profile.strong.push(entry);
     // if they'd previously missed this same question, clear it from weak list — they've got it now
     topic.profile.weak = topic.profile.weak.filter(w => w.question !== question);
-  } else {
-    // avoid duplicate entries for the same question
-    if (!topic.profile.weak.some(w => w.question === question)) topic.profile.weak.push(entry);
+  } else if (!topic.profile.weak.some(w => w.question === question)) {
+    topic.profile.weak.push({ lesson: lessonTitle, question, at: now });
   }
-  // keep lists from growing unbounded
   topic.profile.weak = topic.profile.weak.slice(-15);
-  topic.profile.strong = topic.profile.strong.slice(-30);
+
+  // "strong" now holds one evolving FSRS tracking entry per question (not a growing
+  // history log) so we can compute a real due date instead of a flat 3-day timer.
+  const existing = topic.profile.strong.find(s => s.question === question);
+  const fsrs = fsrsUpdate(existing, wasCorrect, now);
+  if (existing) {
+    Object.assign(existing, { lesson: lessonTitle, at: now, ...fsrs });
+  } else {
+    topic.profile.strong.push({ lesson: lessonTitle, question, at: now, ...fsrs });
+    if (topic.profile.strong.length > 60) topic.profile.strong = topic.profile.strong.slice(-60); // cap unbounded growth
+  }
   saveTopics();
 }
 
@@ -1147,19 +1211,17 @@ function weakConceptTitles(topic) {
   return [...new Set(topic.profile.weak.map(w => w.lesson))];
 }
 
-// Spaced repetition: things answered correctly are "due" for a refresher review
-// after a few days, so they move to long-term memory instead of fading.
-const REVIEW_DUE_AFTER_MS = 3 * 24 * 60 * 60 * 1000; // 3 days
+// Spaced repetition: each question has its own FSRS-computed due date (see fsrsUpdate
+// above) instead of a flat "3 days for everyone" timer — well-known/easy items drift
+// out further, shaky ones come back sooner.
 function dueForReview(topic) {
   const p = topic.profile;
   if (!p || !p.strong.length) return [];
-  const cutoff = Date.now() - REVIEW_DUE_AFTER_MS;
-  // Keep only the most recent correct-answer timestamp per question
-  const latestByQuestion = {};
-  for (const s of p.strong) {
-    if (!latestByQuestion[s.question] || s.at > latestByQuestion[s.question].at) latestByQuestion[s.question] = s;
-  }
-  return Object.values(latestByQuestion).filter(s => s.at < cutoff).slice(-8);
+  const now = Date.now();
+  return p.strong
+    .filter(s => s.dueAt && s.dueAt < now)
+    .sort((a, b) => a.dueAt - b.dueAt) // most overdue first
+    .slice(0, 8);
 }
 function anyTopicDueForReview() {
   return Object.values(state.topics).find(t => dueForReview(t).length > 0) || null;
@@ -1271,6 +1333,29 @@ function stripHtml(html) {
   const d = document.createElement("div");
   d.innerHTML = html || "";
   return d.textContent || "";
+}
+
+// Audio lesson mode — free, zero API cost, built into every modern browser.
+// Voice quality/selection depends entirely on the device (nothing we control).
+function toggleLessonAudio(lesson, listenBtn, stopBtn) {
+  if (!window.speechSynthesis) { alert("Your browser doesn't support text-to-speech."); return; }
+  const synth = window.speechSynthesis;
+  if (synth.speaking && !synth.paused) {
+    synth.pause();
+    listenBtn.textContent = "▶ Resume";
+    return;
+  }
+  if (synth.paused) {
+    synth.resume();
+    listenBtn.textContent = "⏸ Pause";
+    return;
+  }
+  const utterance = new SpeechSynthesisUtterance(stripHtml(lesson.content));
+  utterance.onend = () => { listenBtn.textContent = "🔊 Listen to this lesson"; stopBtn.style.display = "none"; };
+  utterance.onerror = () => { listenBtn.textContent = "🔊 Listen to this lesson"; stopBtn.style.display = "none"; };
+  synth.speak(utterance);
+  listenBtn.textContent = "⏸ Pause";
+  stopBtn.style.display = "inline-block";
 }
 
 function friendlyError(e) {
@@ -1930,7 +2015,7 @@ function LessonView() {
   const idx = state.activeLessonIndex;
   const lesson = topic.lessons[idx];
 
-  wrap.appendChild(el("span", { class: "backlink", onclick: () => { state.view = "curriculum"; render(); } }, "← " + topic.title));
+  wrap.appendChild(el("span", { class: "backlink", onclick: () => { if (window.speechSynthesis) window.speechSynthesis.cancel(); state.view = "curriculum"; render(); } }, "← " + topic.title));
 
   const view = el("div", { class: "lesson-view" });
   view.appendChild(el("h2", {}, lesson.title));
@@ -1952,6 +2037,22 @@ function LessonView() {
       img.addEventListener("error", () => { img.style.display = "none"; });
       view.appendChild(img);
     }
+
+    if (window.speechSynthesis) {
+      const audioRow = el("div", { style: "display:flex;gap:8px;margin-bottom:14px;" });
+      const listenBtn = el("button", { class: "btn-ghost" }, "🔊 Listen to this lesson");
+      const stopBtn = el("button", { class: "btn-ghost", style: "display:none;" }, "⏹ Stop");
+      listenBtn.addEventListener("click", () => toggleLessonAudio(lesson, listenBtn, stopBtn));
+      stopBtn.addEventListener("click", () => {
+        window.speechSynthesis.cancel();
+        listenBtn.textContent = "🔊 Listen to this lesson";
+        stopBtn.style.display = "none";
+      });
+      audioRow.appendChild(listenBtn);
+      audioRow.appendChild(stopBtn);
+      view.appendChild(audioRow);
+    }
+
     const body = el("div", { class: "lesson-body" });
     body.innerHTML = lesson.content;
     view.appendChild(body);
