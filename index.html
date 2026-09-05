@@ -1064,6 +1064,9 @@ let takeawaySession = null; // in-memory only — { queue, index, flipped, brows
 // currentLessonId: the lesson just opened/finished generating, or null when there's no
 // "current" lesson yet (e.g. right after curriculum creation, before any lesson opened).
 function prefetchNextLesson(topic, currentLessonId) {
+  // Don't spend quota on a lesson nobody asked for yet if we're running low —
+  // reserve what's left for lessons/reviews the learner explicitly opens.
+  if (state.realRemaining !== null && state.realRemaining <= 10) return;
   const next = chooseNextLesson(topic, currentLessonId);
   if (!next || next.content) return;
   const key = topic.id + ":" + next.id;
@@ -1483,7 +1486,7 @@ function App() {
   root.appendChild(el("div", { class: "budget" + (budgetWarn ? " warn" : "") }, [
     el("span", { class: "dot" }),
     el("span", {}, knowsReal
-      ? `${remaining} of ${ASSUMED_BUDGET} AI exchanges left today (synced with your account) · lessons are cached once generated, so revisiting them is free`
+      ? `${remaining} of ${ASSUMED_BUDGET} AI exchanges left today (synced with your account) · opening a lesson also quietly pre-generates the next one, and lessons are cached once generated so revisiting them is free`
       : `~${remaining} of ~${ASSUMED_BUDGET} AI exchanges left today (estimate until your first request this session) · lessons are cached once generated, so revisiting them is free`)
   ]));
 
