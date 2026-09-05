@@ -291,9 +291,10 @@ async function getFreeModelList() {
 }
 
 
-// Free tier is roughly 15-40 messages per rolling 5-hour window (OpenRouter's own
-// free-model limits are separate: ~50/day, 20/min). We show an estimate, not a guarantee.
-const ASSUMED_BUDGET = 40;
+// The Worker enforces a real per-account daily cap (DAILY_AI_CAP in cloudflare-worker.js,
+// currently 60/day) — this local number is only a fallback estimate for before the first
+// AI call of the session, when we haven't heard the real count back from the server yet.
+const ASSUMED_BUDGET = 60;
 
 const DAILY_FREE_LIMIT = 50; // OpenRouter's published free-tier daily cap (approximate, may vary)
 const COUNTRIES = ["Global / none", "United States", "United Kingdom", "India", "Nigeria", "Philippines", "Canada", "Australia", "South Africa", "Kenya", "Pakistan", "Brazil", "Mexico", "Germany", "France", "Indonesia", "Other"];
@@ -309,6 +310,7 @@ let state = {
   loadingMsg: "",
   error: null,
   msgCount: 0,
+  realRemaining: null, // filled in from the Worker's X-AI-Usage-Remaining header once we've made a call this session
   quotaUsedToday: 0,
   quotaDate: null,
   streakCount: 0,
@@ -810,6 +812,11 @@ async function callAI(messages, { json = false, maxTokens = 900 } = {}) {
         headers: { "Content-Type": "application/json", "Authorization": "Bearer " + state.session.token },
         body: JSON.stringify({ model, messages, temperature: 0.7, max_tokens: maxTokens })
       });
+      // The Worker tracks the real daily count server-side (per account, across all
+      // devices/sessions) — read it whenever present so the on-screen number reflects
+      // reality instead of a guess that resets every time the page reloads.
+      const realRemaining = res.headers.get("X-AI-Usage-Remaining");
+      if (realRemaining !== null) state.realRemaining = parseInt(realRemaining, 10);
       if (res.status === 401) { logout(); throw new Error("Session expired — please sign in again"); }
       if (res.status === 403) {
         const errData = await res.json().catch(() => ({}));
@@ -1461,12 +1468,14 @@ function App() {
     root.appendChild(toast);
   }
 
-  const used = state.msgCount;
-  const remaining = Math.max(ASSUMED_BUDGET - used, 0);
+  const knowsReal = state.realRemaining !== null;
+  const remaining = knowsReal ? state.realRemaining : Math.max(ASSUMED_BUDGET - state.msgCount, 0);
   const budgetWarn = remaining <= 8;
   root.appendChild(el("div", { class: "budget" + (budgetWarn ? " warn" : "") }, [
     el("span", { class: "dot" }),
-    el("span", {}, `~${remaining} of ~${ASSUMED_BUDGET} AI exchanges left this window (estimate, free tier varies) · lessons are cached once generated, so revisiting them is free`)
+    el("span", {}, knowsReal
+      ? `${remaining} of ${ASSUMED_BUDGET} AI exchanges left today (synced with your account) · lessons are cached once generated, so revisiting them is free`
+      : `~${remaining} of ~${ASSUMED_BUDGET} AI exchanges left today (estimate until your first request this session) · lessons are cached once generated, so revisiting them is free`)
   ]));
 
   if (state.error) {
