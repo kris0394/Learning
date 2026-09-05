@@ -826,7 +826,16 @@ async function callAI(messages, { json = false, maxTokens = 900 } = {}) {
         }
         throw new Error(errData.error || "Not allowed");
       }
-      if (res.status === 429) { throw new Error("Daily AI usage limit reached — resets tomorrow"); }
+      if (res.status === 429) {
+        const errData = await res.json().catch(() => ({}));
+        if (errData.code === "DAILY_CAP_REACHED") {
+          throw new Error("Daily AI usage limit reached — resets tomorrow");
+        }
+        // Not the account's daily cap — just this particular free model being briefly
+        // overloaded (common, since it's free). Try the next candidate model instead
+        // of telling the user they're out of quota when they're not.
+        throw new Error("This free model is temporarily busy — trying another...");
+      }
       if (!res.ok) {
         const t = await res.text().catch(()=> "");
         throw new Error("API error " + res.status + ": " + t.slice(0,200));
